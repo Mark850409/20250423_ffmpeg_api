@@ -1357,4 +1357,14 @@ async def separate_vocals(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    # 從環境變數獲取端口，如果沒有則使用預設值
+    port = int(os.environ.get("PORT", 8000))
+    
+    # 在生產環境中使用 0.0.0.0 作為 host
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        proxy_headers=True,  # 啟用代理標頭支援
+        forwarded_allow_ips="*"  # 允許所有轉發的 IP
+    )

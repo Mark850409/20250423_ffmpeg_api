@@ -15,7 +15,16 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 複製主要應用程式
-COPY main.py .
+COPY . .
+
+# 建立暫存目錄
+RUN mkdir -p /app/temp && chmod 777 /app/temp
+
+# 暴露端口（配合環境變數）
+EXPOSE 8000
+
+# 設定環境變數
+ENV PORT=8000
 
 # 設定啟動 FastAPI 應用
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "main.py"]
