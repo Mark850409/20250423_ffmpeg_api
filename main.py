@@ -1,15 +1,33 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 import ffmpeg
 import uvicorn
 import os
-from typing import Optional, List
+from typing import Optional, List, Dict
 import uuid
 import shutil
 import asyncio
 from datetime import datetime
 import zipfile
+import json
+from enum import Enum
+import aiofiles
+
+# 任務狀態枚舉
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+# 任務追蹤字典
+tasks: Dict[str, Dict] = {}
+
+# 任務結果儲存目錄
+TASK_OUTPUT_DIR = "task_outputs"
+if not os.path.exists(TASK_OUTPUT_DIR):
+    os.makedirs(TASK_OUTPUT_DIR)
 
 app = FastAPI(
     title="FFmpeg 影音處理 API 服務",
@@ -917,10 +935,11 @@ async def create_audio_visualization(
         raise Exception(f"生成音訊視覺化影片時發生錯誤: {str(e)}")
 
 @app.post("/create_audio_visualization_with_subtitle",
-    summary="產生音訊視覺化、多圖背景與字幕合成",
-    description="將音訊檔案、多張背景圖片與 SRT 字幕合成視覺化影片，支援字幕樣式自訂"
+    summary="產生音訊視覺化、多圖背景與字幕合成（非同步）",
+    description="將音訊檔案、多張背景圖片與 SRT 字幕合成視覺化影片，支援字幕樣式自訂。此 API 為非同步處理，會立即回傳任務 ID。"
 )
 async def create_audio_visualization_with_subtitle(
+    background_tasks: BackgroundTasks,
     audio: UploadFile = File(..., description="音訊檔案"),
     backgrounds: List[UploadFile] = File([], description="多張背景圖片"),
     subtitle: UploadFile = File(..., description="字幕檔案（SRT）"),
@@ -960,72 +979,170 @@ async def create_audio_visualization_with_subtitle(
     if not backgrounds:
         raise HTTPException(status_code=400, detail="請至少上傳一張背景圖片")
 
-    temp_image_dir = os.path.join(UPLOAD_DIR, str(uuid.uuid4()))
-    os.makedirs(temp_image_dir, exist_ok=True)
-    audio_path = None
-    output_path = None
-    bg_video_path = None
-    subtitle_path = None
-    temp_video_path = None
+    # 生成任務 ID
+    task_id = str(uuid.uuid4())
+    
+    # 建立任務工作目錄
+    task_dir = os.path.join(TASK_OUTPUT_DIR, task_id)
+    os.makedirs(task_dir, exist_ok=True)
+    
+    # 儲存上傳的檔案
+    audio_path = os.path.join(task_dir, f"audio{os.path.splitext(audio.filename)[1]}")
+    subtitle_path = os.path.join(task_dir, f"subtitle{os.path.splitext(subtitle.filename)[1]}")
+    
+    # 儲存檔案
+    async with aiofiles.open(audio_path, 'wb') as f:
+        await f.write(await audio.read())
+    async with aiofiles.open(subtitle_path, 'wb') as f:
+        await f.write(await subtitle.read())
+    
+    # 儲存背景圖片
+    background_paths = []
+    for i, bg in enumerate(backgrounds):
+        bg_path = os.path.join(task_dir, f"bg_{i}{os.path.splitext(bg.filename)[1]}")
+        async with aiofiles.open(bg_path, 'wb') as f:
+            await f.write(await bg.read())
+        background_paths.append(bg_path)
+    
+    # 儲存任務參數
+    task_params = {
+        "audio_path": audio_path,
+        "subtitle_path": subtitle_path,
+        "background_paths": background_paths,
+        "output_format": output_format,
+        "width": width,
+        "height": height,
+        "image_duration": image_duration,
+        "visualization_type": visualization_type,
+        "wave_mode": wave_mode,
+        "wave_color": wave_color,
+        "spectrum_mode": spectrum_mode,
+        "spectrum_color": spectrum_color,
+        "spectrum_scale": spectrum_scale,
+        "spectrum_saturation": spectrum_saturation,
+        "fps": fps,
+        "opacity": opacity,
+        "font_name": font_name,
+        "font_size": font_size,
+        "font_color": font_color,
+        "font_alpha": font_alpha,
+        "border_style": border_style,
+        "border_size": border_size,
+        "border_color": border_color,
+        "border_alpha": border_alpha,
+        "shadow_size": shadow_size,
+        "shadow_color": shadow_color,
+        "shadow_alpha": shadow_alpha,
+        "background": background,
+        "background_color": background_color,
+        "background_alpha": background_alpha,
+        "margin_vertical": margin_vertical,
+        "alignment": alignment,
+        "duration": duration,
+        "task_dir": task_dir
+    }
+    
+    # 初始化任務狀態
+    tasks[task_id] = {
+        "status": TaskStatus.PENDING,
+        "params": task_params,
+        "output_path": None,
+        "error": None,
+        "progress": 0,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None
+    }
+    
+    # 在背景執行任務
+    background_tasks.add_task(process_visualization_task, task_id)
+    
+    return JSONResponse({
+        "task_id": task_id,
+        "status": TaskStatus.PENDING,
+        "message": "任務已提交，請使用任務 ID 查詢進度"
+    })
+
+@app.get("/task/{task_id}",
+    summary="查詢任務狀態",
+    description="使用任務 ID 查詢處理進度，當任務完成時會回傳下載連結"
+)
+async def get_task_status(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="找不到指定的任務")
+    
+    task = tasks[task_id]
+    response = {
+        "task_id": task_id,
+        "status": task["status"],
+        "progress": task["progress"],
+        "created_at": task["created_at"]
+    }
+    
+    if task["status"] == TaskStatus.COMPLETED:
+        # 產生下載用的檔名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_filename = f"audio_visualization_subtitle_{timestamp}.{task['params']['output_format']}"
+        
+        # 設定下載連結和檔名
+        response["download_url"] = f"/download/{task_id}/{output_filename}"
+        response["filename"] = output_filename
+        response["completed_at"] = task["completed_at"]
+    elif task["status"] == TaskStatus.FAILED:
+        response["error"] = task["error"]
+    
+    return JSONResponse(response)
+
+@app.get("/download/{task_id}/{filename}",
+    summary="下載已完成的任務結果",
+    description="下載已完成任務的視覺化影片檔案"
+)
+async def download_task_result(task_id: str, filename: str):
+    if task_id not in tasks or tasks[task_id]["status"] != TaskStatus.COMPLETED:
+        raise HTTPException(status_code=404, detail="找不到可下載的檔案")
+    
+    output_path = tasks[task_id]["output_path"]
+    if not output_path or not os.path.exists(output_path):
+        raise HTTPException(status_code=404, detail="檔案不存在")
+    
+    return FileResponse(
+        path=output_path,
+        media_type='video/mp4',
+        filename=filename,
+        background=BackgroundTask(lambda: None)  # 不刪除檔案，由清理任務處理
+    )
+
+async def process_visualization_task(task_id: str):
+    """處理視覺化任務的背景工作函數"""
+    task = tasks[task_id]
+    params = task["params"]
     
     try:
-        # 儲存音訊檔案
-        audio_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}{os.path.splitext(audio.filename)[1]}")
-        with open(audio_path, "wb") as buffer:
-            content = await audio.read()
-            buffer.write(content)
-
-        # 儲存字幕檔案
-        subtitle_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.srt")
-        with open(subtitle_path, "wb") as buffer:
-            content = await subtitle.read()
-            buffer.write(content)
-
-        # 儲存多張圖片
-        image_files = []
-        for i, img in enumerate(backgrounds):
-            try:
-                if not img or not img.filename:
-                    print(f"跳過無效的背景圖片 {i}")
-                    continue
-                
-                img_path = os.path.join(temp_image_dir, f"img_{i:04d}{os.path.splitext(img.filename)[1]}")
-                content = await img.read()
-                if not content:
-                    print(f"背景圖片 {i} 內容為空")
-                    continue
-                    
-                with open(img_path, "wb") as buffer:
-                    buffer.write(content)
-                image_files.append(img_path)
-            except Exception as e:
-                print(f"處理背景圖片 {i} 時發生錯誤: {str(e)}")
-                continue
-
-        if not image_files:
-            raise HTTPException(status_code=400, detail="無法處理任何背景圖片，請確認上傳的圖片格式正確")
-
-        # 生成背景影片
-        bg_video_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.mp4")
+        # 更新狀態為處理中
+        tasks[task_id]["status"] = TaskStatus.PROCESSING
+        
+        # 建立輸出路徑
+        output_path = os.path.join(params["task_dir"], f"output.{params['output_format']}")
+        temp_image_dir = os.path.join(params["task_dir"], "temp_images")
+        os.makedirs(temp_image_dir, exist_ok=True)
+        
+        # 處理背景影片
+        tasks[task_id]["progress"] = 10
+        bg_video_path = os.path.join(params["task_dir"], "background.mp4")
         
         # 建立 filter_complex
         filter_parts = []
+        for i, _ in enumerate(params["background_paths"]):
+            filter_parts.append(f"[{i}:v]scale={params['width']}:{params['height']},setsar=1[scaled{i}]")
         
-        # 處理每張圖片的縮放
-        for i in range(len(image_files)):
-            filter_parts.append(f"[{i}:v]scale={width}:{height},setsar=1[scaled{i}]")
+        concat_inputs = "".join(f"[scaled{i}]" for i in range(len(params["background_paths"])))
+        filter_parts.append(f"{concat_inputs}concat=n={len(params['background_paths'])}:v=1:a=0[outv]")
         
-        # 建立串接指令
-        concat_inputs = "".join(f"[scaled{i}]" for i in range(len(image_files)))
-        filter_parts.append(f"{concat_inputs}concat=n={len(image_files)}:v=1:a=0[outv]")
-        
-        # 組合完整的 filter_complex
         filter_complex = ";".join(filter_parts)
         
         # 建立輸入檔案列表
         input_files = []
-        for img_path in image_files:
-            input_files.extend(["-loop", "1", "-t", str(image_duration), "-i", img_path])
+        for img_path in params["background_paths"]:
+            input_files.extend(["-loop", "1", "-t", str(params["image_duration"]), "-i", img_path])
         
         # 執行 FFmpeg 命令生成背景影片
         cmd = [
@@ -1044,65 +1161,64 @@ async def create_audio_visualization_with_subtitle(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate()
+        await process.communicate()
         
         if process.returncode != 0:
-            print(f"FFmpeg stderr: {stderr.decode()}")
             raise Exception("背景影片生成失敗")
-
-        # 生成音訊視覺化影片（不含字幕）
-        temp_video_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.{output_format}")
+        
+        # 生成音訊視覺化影片
+        tasks[task_id]["progress"] = 40
+        temp_video_path = os.path.join(params["task_dir"], "temp_video.mp4")
+        
         cmd = create_visualization_command(
-            audio_path=audio_path,
+            audio_path=params["audio_path"],
             background_path=bg_video_path,
             output_path=temp_video_path,
-            width=width,
-            height=height,
-            visualization_type=visualization_type,
-            wave_mode=wave_mode,
-            wave_color=wave_color,
-            spectrum_mode=spectrum_mode,
-            spectrum_color=spectrum_color,
-            spectrum_scale=spectrum_scale,
-            spectrum_saturation=spectrum_saturation,
-            fps=fps,
-            opacity=opacity,
-            duration=duration
+            width=params["width"],
+            height=params["height"],
+            visualization_type=params["visualization_type"],
+            wave_mode=params["wave_mode"],
+            wave_color=params["wave_color"],
+            spectrum_mode=params["spectrum_mode"],
+            spectrum_color=params["spectrum_color"],
+            spectrum_scale=params["spectrum_scale"],
+            spectrum_saturation=params["spectrum_saturation"],
+            fps=params["fps"],
+            opacity=params["opacity"],
+            duration=params["duration"]
         )
-
+        
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate()
+        await process.communicate()
         
         if process.returncode != 0:
-            raise Exception(f"FFmpeg error: {stderr.decode()}")
-
-        # 將字幕加入到視覺化影片中
-        output_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.{output_format}")
-        safe_subtitle_path = subtitle_path.replace('\\', '/').replace(':', '\\:')
-
-        # 設定字幕過濾器
+            raise Exception("音訊視覺化影片生成失敗")
+        
+        # 加入字幕
+        tasks[task_id]["progress"] = 70
+        safe_subtitle_path = params["subtitle_path"].replace('\\', '/').replace(':', '\\:')
+        
         filter_complex = (
             f"subtitles={safe_subtitle_path}"
             f":force_style='"
-            f"Fontname={font_name},"
-            f"FontSize={font_size},"
-            f"PrimaryColour=&H{font_color_to_ass_color(font_color, font_alpha)},"
-            f"OutlineColour=&H{font_color_to_ass_color(border_color, border_alpha)},"
-            f"BackColour=&H{font_color_to_ass_color(background_color, background_alpha)},"
-            f"BorderStyle={border_style},"
-            f"Outline={border_size},"
-            f"Shadow={shadow_size},"
-            f"MarginV={margin_vertical},"
-            f"Alignment={alignment},"
+            f"Fontname={params['font_name']},"
+            f"FontSize={params['font_size']},"
+            f"PrimaryColour=&H{font_color_to_ass_color(params['font_color'], params['font_alpha'])},"
+            f"OutlineColour=&H{font_color_to_ass_color(params['border_color'], params['border_alpha'])},"
+            f"BackColour=&H{font_color_to_ass_color(params['background_color'], params['background_alpha'])},"
+            f"BorderStyle={params['border_style']},"
+            f"Outline={params['border_size']},"
+            f"Shadow={params['shadow_size']},"
+            f"MarginV={params['margin_vertical']},"
+            f"Alignment={params['alignment']},"
             f"Bold=1,"
-            f"BackColour=&H{font_color_to_ass_color(background_color, background_alpha)}'"
+            f"BackColour=&H{font_color_to_ass_color(params['background_color'], params['background_alpha'])}'"
         )
-
-        # 執行最終的 FFmpeg 命令
+        
         cmd = [
             'ffmpeg',
             '-i', temp_video_path,
@@ -1112,76 +1228,79 @@ async def create_audio_visualization_with_subtitle(
             '-y',
             output_path
         ]
-
+        
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await process.communicate()
+        await process.communicate()
         
         if process.returncode != 0:
-            print(f"FFmpeg error: {stderr.decode()}")
-            raise Exception(f"FFmpeg error: {stderr.decode()}")
-
-        # 產生下載檔名
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"audio_visualization_subtitle_{timestamp}.{output_format}"
-
-        response = FileResponse(
-            path=output_path,
-            media_type='video/mp4',
-            filename=output_filename
-        )
-
-        # 設定回應完成後清理所有暫存檔案
-        async def cleanup():
-            cleanup_files = [
-                audio_path,
-                subtitle_path,
-                bg_video_path,
-                temp_video_path,
-                output_path
-            ]
-            for file_path in cleanup_files:
-                if file_path and os.path.exists(file_path):
-                    try:
-                        os.remove(file_path)
-                    except Exception as e:
-                        print(f"清理檔案失敗 {file_path}: {str(e)}")
-            
-            if os.path.exists(temp_image_dir):
-                try:
-                    shutil.rmtree(temp_image_dir)
-                except Exception as e:
-                    print(f"清理目錄失敗 {temp_image_dir}: {str(e)}")
-
-        response.background = BackgroundTask(cleanup)
-        return response
-
+            raise Exception("字幕加入失敗")
+        
+        # 更新任務狀態為完成
+        tasks[task_id].update({
+            "status": TaskStatus.COMPLETED,
+            "output_path": output_path,
+            "progress": 100,
+            "completed_at": datetime.now().isoformat()
+        })
+        
+        # 清理中間檔案
+        if os.path.exists(bg_video_path):
+            os.remove(bg_video_path)
+        if os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
+        
     except Exception as e:
-        # 發生錯誤時清理所有檔案
-        cleanup_files = [
-            audio_path,
-            subtitle_path,
-            bg_video_path,
-            temp_video_path,
-            output_path
-        ]
-        for file_path in cleanup_files:
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except Exception as cleanup_error:
-                    print(f"清理檔案失敗 {file_path}: {str(cleanup_error)}")
+        # 更新任務狀態為失敗
+        tasks[task_id].update({
+            "status": TaskStatus.FAILED,
+            "error": str(e),
+            "completed_at": datetime.now().isoformat()
+        })
         
-        if os.path.exists(temp_image_dir):
-            try:
-                shutil.rmtree(temp_image_dir)
-            except Exception as cleanup_error:
-                print(f"清理目錄失敗 {temp_image_dir}: {str(cleanup_error)}")
+        # 清理所有檔案
+        try:
+            shutil.rmtree(params["task_dir"])
+        except Exception:
+            pass
+
+# 定期清理已完成的任務
+async def cleanup_tasks():
+    while True:
+        try:
+            current_time = datetime.now()
+            tasks_to_remove = []
+            
+            for task_id, task in tasks.items():
+                if task["status"] in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
+                    completed_at = datetime.fromisoformat(task["completed_at"])
+                    # 清理超過 1 小時的任務
+                    if (current_time - completed_at).total_seconds() > 3600:
+                        if task["status"] == TaskStatus.COMPLETED and task["output_path"]:
+                            try:
+                                if os.path.exists(task["params"]["task_dir"]):
+                                    shutil.rmtree(task["params"]["task_dir"])
+                            except Exception:
+                                pass
+                        tasks_to_remove.append(task_id)
+            
+            # 移除已清理的任務
+            for task_id in tasks_to_remove:
+                del tasks[task_id]
+                
+        except Exception as e:
+            print(f"清理任務時發生錯誤: {str(e)}")
         
-        raise HTTPException(status_code=500, detail=str(e))
+        # 每 15 分鐘執行一次清理
+        await asyncio.sleep(900)
+
+# 在應用程式啟動時開始清理任務
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(cleanup_tasks())
 
 def create_visualization_command(
     audio_path: str,
