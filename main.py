@@ -1479,13 +1479,13 @@ async def separate_vocals(
 
 @app.post("/create_video_with_subtitle_async",
     summary="非同步：多圖合成影片並加字幕",
-    description="將多張圖片與音樂合成影片後再加上字幕，支援非同步任務查詢與下載。"
+    description="將多張圖片與多個音樂、字幕合成影片後再加上字幕，支援非同步任務查詢與下載。"
 )
 async def create_video_with_subtitle_async(
     background_tasks: BackgroundTasks,
     images: List[UploadFile] = File(..., description="要合成的圖片檔案列表"),
-    audio: UploadFile = File(..., description="背景音樂檔案"),
-    subtitle: UploadFile = File(..., description="字幕檔案（SRT）"),
+    audios: List[UploadFile] = File(..., description="多個背景音樂檔案"),
+    subtitles: List[UploadFile] = File(..., description="多個字幕檔案（SRT）"),
     duration_per_image: float = 5.0,
     output_format: str = "mp4",
     width: int = 1920,
@@ -1512,9 +1512,10 @@ async def create_video_with_subtitle_async(
     alignment: int = 2
 ):
     """
-    非同步多圖合成影片並加字幕 API
+    非同步多圖合成影片並加字幕 API（支援多音樂、多字幕串接）
     """
     import aiofiles
+    import tempfile
     # 產生任務 ID 與目錄
     task_id = str(uuid.uuid4())
     task_dir = os.path.join(TASK_OUTPUT_DIR, task_id)
@@ -1526,19 +1527,51 @@ async def create_video_with_subtitle_async(
         async with aiofiles.open(img_path, 'wb') as f:
             await f.write(await img.read())
         image_paths.append(img_path)
-    # 儲存音樂
-    audio_path = os.path.join(task_dir, f"audio{os.path.splitext(audio.filename)[1]}")
-    async with aiofiles.open(audio_path, 'wb') as f:
-        await f.write(await audio.read())
-    # 儲存字幕
-    subtitle_path = os.path.join(task_dir, f"subtitle{os.path.splitext(subtitle.filename)[1]}")
-    async with aiofiles.open(subtitle_path, 'wb') as f:
-        await f.write(await subtitle.read())
+    # 儲存多個音樂
+    audio_paths = []
+    for i, audio in enumerate(audios):
+        audio_path = os.path.join(task_dir, f"audio_{i}{os.path.splitext(audio.filename)[1]}")
+        content = await audio.read()
+        async with aiofiles.open(audio_path, 'wb') as f:
+            await f.write(content)
+        audio_paths.append(audio_path)
+    # 檢查檔案都存在且有內容
+    for p in audio_paths:
+        if not os.path.exists(p) or os.path.getsize(p) == 0:
+            raise HTTPException(status_code=400, detail=f"音樂檔案不存在或為空: {p}")
+    # 串接音樂
+    concat_audio_path = os.path.join(task_dir, "concat_audio.mp3")
+    if len(audio_paths) == 1:
+        import shutil
+        shutil.copy(audio_paths[0], concat_audio_path)
+    else:
+        concat_list_path = os.path.join(task_dir, "concat_list.txt")
+        with open(concat_list_path, 'w', encoding='utf-8') as f:
+            for p in audio_paths:
+                abs_path = os.path.abspath(p).replace("\\", "/")
+                f.write(f"file '{abs_path}'\n")
+        if not os.path.exists(concat_list_path):
+            raise HTTPException(status_code=500, detail="concat_list.txt 未正確產生")
+        import subprocess
+        cmd = [
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', concat_audio_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if result.returncode != 0 or not os.path.exists(concat_audio_path):
+            raise HTTPException(status_code=500, detail=f"音樂串接失敗: {result.stderr.decode()}")
+    # 儲存多個字幕並合併
+    merged_subtitle_path = os.path.join(task_dir, "merged_subtitle.srt")
+    async with aiofiles.open(merged_subtitle_path, 'wb') as merged_f:
+        for i, subtitle in enumerate(subtitles):
+            content = await subtitle.read()
+            await merged_f.write(content)
+            if i < len(subtitles) - 1:
+                await merged_f.write(b"\n")  # 分隔
     # 任務參數
     task_params = {
         "image_paths": image_paths,
-        "audio_path": audio_path,
-        "subtitle_path": subtitle_path,
+        "audio_path": concat_audio_path,
+        "subtitle_path": merged_subtitle_path,
         "output_format": output_format,
         "width": width,
         "height": height,
