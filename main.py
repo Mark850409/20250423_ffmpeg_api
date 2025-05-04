@@ -13,6 +13,8 @@ import zipfile
 import json
 from enum import Enum
 import aiofiles
+import tempfile
+import subprocess
 
 # 任務狀態枚舉
 class TaskStatus(str, Enum):
@@ -1474,6 +1476,269 @@ async def separate_vocals(
         if 'temp_dir' in locals() and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/create_video_with_subtitle_async",
+    summary="非同步：多圖合成影片並加字幕",
+    description="將多張圖片與音樂合成影片後再加上字幕，支援非同步任務查詢與下載。"
+)
+async def create_video_with_subtitle_async(
+    background_tasks: BackgroundTasks,
+    images: List[UploadFile] = File(..., description="要合成的圖片檔案列表"),
+    audio: UploadFile = File(..., description="背景音樂檔案"),
+    subtitle: UploadFile = File(..., description="字幕檔案（SRT）"),
+    duration_per_image: float = 5.0,
+    output_format: str = "mp4",
+    width: int = 1920,
+    height: int = 1080,
+    fade_duration: float = 1.0,
+    transition_type: str = "fade",
+    transition_duration: float = 2.0,
+    # 字幕樣式
+    font_name: str = "Arial",
+    font_size: int = 24,
+    font_color: str = "white",
+    font_alpha: float = 1.0,
+    border_style: int = 3,
+    border_size: int = 1,
+    border_color: str = "black",
+    border_alpha: float = 1.0,
+    shadow_size: int = 2,
+    shadow_color: str = "black",
+    shadow_alpha: float = 0.5,
+    background: bool = True,
+    background_color: str = "black",
+    background_alpha: float = 0.5,
+    margin_vertical: int = 20,
+    alignment: int = 2
+):
+    """
+    非同步多圖合成影片並加字幕 API
+    """
+    import aiofiles
+    # 產生任務 ID 與目錄
+    task_id = str(uuid.uuid4())
+    task_dir = os.path.join(TASK_OUTPUT_DIR, task_id)
+    os.makedirs(task_dir, exist_ok=True)
+    # 儲存圖片
+    image_paths = []
+    for i, img in enumerate(images):
+        img_path = os.path.join(task_dir, f"img_{i}{os.path.splitext(img.filename)[1]}")
+        async with aiofiles.open(img_path, 'wb') as f:
+            await f.write(await img.read())
+        image_paths.append(img_path)
+    # 儲存音樂
+    audio_path = os.path.join(task_dir, f"audio{os.path.splitext(audio.filename)[1]}")
+    async with aiofiles.open(audio_path, 'wb') as f:
+        await f.write(await audio.read())
+    # 儲存字幕
+    subtitle_path = os.path.join(task_dir, f"subtitle{os.path.splitext(subtitle.filename)[1]}")
+    async with aiofiles.open(subtitle_path, 'wb') as f:
+        await f.write(await subtitle.read())
+    # 任務參數
+    task_params = {
+        "image_paths": image_paths,
+        "audio_path": audio_path,
+        "subtitle_path": subtitle_path,
+        "output_format": output_format,
+        "width": width,
+        "height": height,
+        "duration_per_image": duration_per_image,
+        "fade_duration": fade_duration,
+        "transition_type": transition_type,
+        "transition_duration": transition_duration,
+        "font_name": font_name,
+        "font_size": font_size,
+        "font_color": font_color,
+        "font_alpha": font_alpha,
+        "border_style": border_style,
+        "border_size": border_size,
+        "border_color": border_color,
+        "border_alpha": border_alpha,
+        "shadow_size": shadow_size,
+        "shadow_color": shadow_color,
+        "shadow_alpha": shadow_alpha,
+        "background": background,
+        "background_color": background_color,
+        "background_alpha": background_alpha,
+        "margin_vertical": margin_vertical,
+        "alignment": alignment,
+        "task_dir": task_dir
+    }
+    # 初始化任務狀態
+    tasks[task_id] = {
+        "status": TaskStatus.PENDING,
+        "params": task_params,
+        "output_path": None,
+        "error": None,
+        "progress": 0,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None
+    }
+    # 啟動背景任務
+    background_tasks.add_task(process_video_with_subtitle_task, task_id)
+    return JSONResponse({
+        "task_id": task_id,
+        "status": TaskStatus.PENDING,
+        "message": "任務已提交，請使用任務 ID 查詢進度"
+    })
+
+async def process_video_with_subtitle_task(task_id: str):
+    task = tasks[task_id]
+    params = task["params"]
+    try:
+        # 狀態：合成影片
+        tasks[task_id]["status"] = TaskStatus.PROCESSING
+        tasks[task_id]["progress"] = 10
+        video_path = os.path.join(params["task_dir"], f"video.{params['output_format']}")
+        # 1. 圖片+音樂合成影片
+        # 建立 filter_complex 字串
+        filter_complex = []
+        for i, _ in enumerate(params["image_paths"]):
+            filter_complex.append(f"[{i}:v]scale={params['width']}:{params['height']}:force_original_aspect_ratio=decrease,pad={params['width']}:{params['height']}:(ow-iw)/2:(oh-ih)/2[scaled{i}];")
+            if params["transition_type"] == "fade":
+                if i == 0:
+                    filter_complex.append(f"[scaled{i}]fade=t=out:st={params['duration_per_image']-params['transition_duration']}:d={params['transition_duration']}[v{i}];")
+                elif i == len(params["image_paths"]) - 1:
+                    filter_complex.append(f"[scaled{i}]fade=t=in:st=0:d={params['transition_duration']}[v{i}];")
+                else:
+                    filter_complex.append(f"[scaled{i}]fade=t=in:st=0:d={params['transition_duration']},fade=t=out:st={params['duration_per_image']-params['transition_duration']}:d={params['transition_duration']}[v{i}];")
+            elif params["transition_type"] == "dissolve":
+                if i == 0:
+                    filter_complex.append(f"[scaled{i}]format=rgba,fade=t=out:st={params['duration_per_image']-params['transition_duration']}:d={params['transition_duration']}:alpha=1[v{i}];")
+                elif i == len(params["image_paths"]) - 1:
+                    filter_complex.append(f"[scaled{i}]format=rgba,fade=t=in:st=0:d={params['transition_duration']}:alpha=1[v{i}];")
+                else:
+                    filter_complex.append(f"[scaled{i}]format=rgba,fade=t=in:st=0:d={params['transition_duration']}:alpha=1,fade=t=out:st={params['duration_per_image']-params['transition_duration']}:d={params['transition_duration']}:alpha=1[v{i}];")
+        video_inputs = ''.join(f'[v{i}]' for i in range(len(params["image_paths"])))
+        filter_complex.append(f"{video_inputs}concat=n={len(params['image_paths'])}:v=1:a=0[outv]")
+        filter_complex_str = ''.join(filter_complex)
+        input_args = []
+        for img_path in params["image_paths"]:
+            input_args.extend(['-loop', '1', '-t', str(params["duration_per_image"]), '-i', img_path])
+        input_args.extend(['-i', params["audio_path"]])
+        cmd = [
+            'ffmpeg',
+            *input_args,
+            '-filter_complex', filter_complex_str,
+            '-map', '[outv]',
+            '-map', f'{len(params["image_paths"])}:a',
+            '-shortest',
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-profile:v', 'high',
+            '-crf', '23',
+            '-movflags', '+faststart',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-pix_fmt', 'yuv420p',
+            '-y',
+            video_path
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process.communicate()
+        if process.returncode != 0 or not os.path.exists(video_path):
+            raise Exception("合成影片失敗")
+        tasks[task_id]["progress"] = 60
+        # 2. 加字幕
+        output_path = os.path.join(params["task_dir"], f"output.{params['output_format']}")
+        safe_subtitle_path = params["subtitle_path"].replace('\\', '/').replace(':', '\\:')
+        filter_complex_sub = (
+            f"subtitles={safe_subtitle_path}"
+            f":force_style='"
+            f"Fontname={params['font_name']},"
+            f"FontSize={params['font_size']},"
+            f"PrimaryColour=&H{font_color_to_ass_color(params['font_color'], params['font_alpha'])},"
+            f"OutlineColour=&H{font_color_to_ass_color(params['border_color'], params['border_alpha'])},"
+            f"BackColour=&H{font_color_to_ass_color(params['background_color'], params['background_alpha'])},"
+            f"BorderStyle={params['border_style']},"
+            f"Outline={params['border_size']},"
+            f"Shadow={params['shadow_size']},"
+            f"MarginV={params['margin_vertical']},"
+            f"Alignment={params['alignment']},"
+            f"Bold=1,"
+            f"BackColour=&H{font_color_to_ass_color(params['background_color'], params['background_alpha'])}'"
+        )
+        cmd2 = [
+            'ffmpeg',
+            '-i', video_path,
+            '-vf', filter_complex_sub,
+            '-c:v', 'libx264',
+            '-c:a', 'copy',
+            '-y',
+            output_path
+        ]
+        process2 = await asyncio.create_subprocess_exec(
+            *cmd2,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await process2.communicate()
+        if process2.returncode != 0 or not os.path.exists(output_path):
+            raise Exception("加字幕失敗")
+        tasks[task_id].update({
+            "status": TaskStatus.COMPLETED,
+            "output_path": output_path,
+            "progress": 100,
+            "completed_at": datetime.now().isoformat()
+        })
+        # 清理中間檔案
+        if os.path.exists(video_path):
+            os.remove(video_path)
+    except Exception as e:
+        tasks[task_id].update({
+            "status": TaskStatus.FAILED,
+            "error": str(e),
+            "completed_at": datetime.now().isoformat()
+        })
+        try:
+            shutil.rmtree(params["task_dir"])
+        except Exception:
+            pass
+
+@app.post("/get_audio_duration",
+    summary="取得音檔秒數",
+    description="上傳mp3音檔，回傳音檔的總秒數"
+)
+async def get_audio_duration(
+    audio: UploadFile = File(..., description="音訊檔案（mp3）")
+):
+    """
+    取得音檔秒數 API
+    - 上傳 mp3 音檔，回傳音檔長度（秒，float）
+    """
+    import tempfile
+    import subprocess
+    import json
+    import os
+    # 儲存暫存檔
+    suffix = os.path.splitext(audio.filename)[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
+    try:
+        # 使用 ffprobe 取得音檔資訊
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'json',
+            tmp_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise Exception(f"ffprobe error: {result.stderr}")
+        info = json.loads(result.stdout)
+        duration = float(info['format']['duration']) if 'format' in info and 'duration' in info['format'] else None
+        if duration is None:
+            raise Exception("無法取得音檔長度")
+        return {"duration": duration}
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 if __name__ == "__main__":
     # 從環境變數獲取端口，如果沒有則使用預設值
