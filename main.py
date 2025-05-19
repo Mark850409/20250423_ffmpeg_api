@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Query
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.background import BackgroundTask
 import ffmpeg
@@ -15,6 +15,9 @@ from enum import Enum
 import aiofiles
 import tempfile
 import subprocess
+import glob
+from random import choice
+import random
 
 # 任務狀態枚舉
 class TaskStatus(str, Enum):
@@ -31,6 +34,11 @@ TASK_OUTPUT_DIR = "task_outputs"
 if not os.path.exists(TASK_OUTPUT_DIR):
     os.makedirs(TASK_OUTPUT_DIR)
 
+# 設定圖片儲存目錄
+IMAGE_STORAGE_DIR = "image_storage"
+if not os.path.exists(IMAGE_STORAGE_DIR):
+    os.makedirs(IMAGE_STORAGE_DIR)
+
 app = FastAPI(
     title="FFmpeg 影音處理 API 服務",
     description="提供影片轉檔、圖片合成影片等功能的 API 服務",
@@ -44,7 +52,18 @@ if not os.path.exists(UPLOAD_DIR):
 
 @app.post("/convert", 
     summary="影片格式轉換",
-    description="將上傳的影片轉換為指定格式，支援調整解析度和編碼器"
+    description="""
+參數說明：
+- file (UploadFile, 必填)：要轉換的影片檔案
+- output_format (str, 預設mp4)：輸出格式
+- video_codec (str, 選填)：視訊編碼器
+- audio_codec (str, 選填)：音訊編碼器
+- width (int, 選填)：輸出影片寬度
+- height (int, 選填)：輸出影片高度
+
+回傳：
+- 轉換後的影片檔案
+"""
 )
 async def convert_video(
     file: UploadFile = File(..., description="要轉換的影片檔案"),
@@ -114,7 +133,12 @@ async def convert_video(
 
 @app.get("/health",
     summary="服務健康檢查",
-    description="檢查 API 服務是否正常運作"
+    description="""
+健康檢查 API
+
+回傳：
+- status: 服務狀態
+"""
 )
 async def health_check():
     """
@@ -127,7 +151,21 @@ async def health_check():
 
 @app.post("/create_video",
     summary="圖片合成影片",
-    description="將多張圖片和音樂合成為影片，支援多種轉場效果"
+    description="""
+參數說明：
+- images (List[UploadFile], 必填)：要合成的圖片檔案列表
+- audio (UploadFile, 必填)：背景音樂檔案
+- duration_per_image (float, 預設5)：每張圖片顯示秒數
+- output_format (str, 預設mp4)：輸出影片格式
+- width (int, 預設1920)：影片寬度
+- height (int, 預設1080)：影片高度
+- fade_duration (float, 預設1)：淡入淡出時間（秒）
+- transition_type (str, 預設fade)：轉場效果類型（fade/dissolve）
+- transition_duration (float, 預設2)：轉場效果持續時間（秒）
+
+回傳：
+- 合成後的影片檔案
+"""
 )
 async def create_video_from_images(
     images: List[UploadFile] = File(..., description="要合成的圖片檔案列表"),
@@ -310,7 +348,34 @@ async def create_video_from_images(
 
 @app.post("/add_subtitle",
     summary="為影片加入字幕",
-    description="將字幕檔案加入到影片中，支援 SRT 格式字幕檔，可自訂字幕樣式"
+    description="""
+參數說明：
+- video (UploadFile, 必填)：要加入字幕的影片檔案
+- subtitle (UploadFile, 必填)：字幕檔案（SRT）
+- output_format (str, 預設mp4)：輸出影片格式
+- encoding (str, 預設utf-8)：字幕檔案編碼格式
+
+字幕樣式參數：
+- font_name (str, 預設Arial)：字型名稱
+- font_size (int, 預設24)：字型大小
+- font_color (str, 預設white)：字型顏色
+- font_alpha (float, 預設1.0)：字型透明度（0~1）
+- border_style (int, 預設3)：邊框樣式
+- border_size (int, 預設1)：邊框大小
+- border_color (str, 預設black)：邊框顏色
+- border_alpha (float, 預設1.0)：邊框透明度（0~1）
+- shadow_size (int, 預設2)：陰影大小
+- shadow_color (str, 預設black)：陰影顏色
+- shadow_alpha (float, 預設0.5)：陰影透明度（0~1）
+- background (bool, 預設True)：是否顯示字幕背景
+- background_color (str, 預設black)：字幕背景顏色
+- background_alpha (float, 預設0.5)：字幕背景透明度（0~1）
+- margin_vertical (int, 預設20)：字幕垂直邊距
+- alignment (int, 預設2)：字幕對齊方式（1~9，2為底部置中）
+
+回傳：
+- 加入字幕後的影片檔案
+"""
 )
 async def add_subtitle(
     video: UploadFile = File(..., description="要加入字幕的影片檔案"),
@@ -520,7 +585,21 @@ def font_color_to_ass_color(color: str, alpha: float = 1.0) -> str:
 
 @app.post("/create_waveform",
     summary="產生音訊波形視覺化",
-    description="將音訊檔案轉換為波形視覺化影片，支援自訂波形樣式和顏色"
+    description="""
+參數說明：
+- audio (UploadFile, 必填)：音訊檔案
+- output_format (str, 預設mp4)：輸出格式
+- width (int, 預設1920)：影片寬度
+- height (int, 預設1080)：影片高度
+- wave_mode (str, 預設line)：波形模式（line/point/p2p/cline）
+- wave_color (str, 預設white)：波形顏色
+- background_color (str, 預設black)：背景顏色
+- fps (int, 預設30)：幀率
+- duration (float, 選填)：指定輸出影片長度
+
+回傳：
+- 波形視覺化影片
+"""
 )
 async def create_waveform(
     audio: UploadFile = File(..., description="音訊檔案"),
@@ -633,7 +712,24 @@ async def create_waveform(
 
 @app.post("/create_spectrogram",
     summary="產生音訊頻譜視覺化",
-    description="將音訊檔案轉換為頻譜視覺化影片，支援自訂頻譜樣式和顏色"
+    description="""
+參數說明：
+- audio (UploadFile, 必填)：音訊檔案
+- output_format (str, 預設mp4)：輸出格式
+- width (int, 預設1920)：影片寬度
+- height (int, 預設1080)：影片高度
+- mode (str, 預設combined)：頻譜模式（combined/separate）
+- color_mode (str, 預設intensity)：顏色模式（intensity/channel）
+- scale (str, 預設log)：頻率刻度（lin/log/sqrt）
+- saturation (float, 預設1.0)：顏色飽和度
+- win_func (str, 預設hanning)：窗函數
+- fps (int, 預設30)：影片幀率
+- background_color (str, 預設black)：背景顏色
+- duration (float, 選填)：指定輸出影片長度
+
+回傳：
+- 頻譜視覺化影片
+"""
 )
 async def create_spectrogram(
     audio: UploadFile = File(..., description="音訊檔案"),
@@ -763,7 +859,28 @@ async def create_spectrogram(
 
 @app.post("/create_audio_visualization",
     summary="產生音訊視覺化與多圖背景合成",
-    description="將音訊檔案與多張背景圖片合成為視覺化影片，支援波形或頻譜效果"
+    description="""
+參數說明：
+- audio (UploadFile, 必填)：音訊檔案
+- backgrounds (List[UploadFile], 必填)：多張背景圖片
+- output_format (str, 預設mp4)：輸出影片格式
+- width (int, 預設1920)：影片寬度
+- height (int, 預設1080)：影片高度
+- image_duration (float, 預設5)：每張圖片顯示秒數
+- visualization_type (str, 預設waveform)：視覺化類型（waveform/spectrum）
+- wave_mode (str, 預設line)：波形模式
+- wave_color (str, 預設white)：波形顏色
+- spectrum_mode (str, 預設combined)：頻譜模式
+- spectrum_color (str, 預設intensity)：頻譜顏色
+- spectrum_scale (str, 預設log)：頻譜刻度
+- spectrum_saturation (float, 預設1.0)：頻譜飽和度
+- fps (int, 預設30)：幀率
+- opacity (float, 預設0.8)：視覺化圖層透明度
+- duration (float, 選填)：指定輸出影片長度
+
+回傳：
+- 音訊視覺化影片
+"""
 )
 async def create_audio_visualization(
     audio: UploadFile = File(..., description="音訊檔案"),
@@ -889,8 +1006,9 @@ async def create_audio_visualization(
         stdout, stderr = await process.communicate()
         
         if process.returncode != 0:
-            print(f"FFmpeg error: {stderr.decode()}")
-            raise Exception(f"FFmpeg error: {stderr.decode()}")
+            error_detail = stderr.decode(errors="ignore")
+            print(f"FFmpeg error: {error_detail}")
+            raise Exception(f"音訊視覺化影片生成失敗: {error_detail}")
 
         # 檢查輸出檔案
         if not os.path.exists(output_path):
@@ -938,12 +1056,40 @@ async def create_audio_visualization(
 
 @app.post("/create_audio_visualization_with_subtitle",
     summary="產生音訊視覺化、多圖背景與字幕合成（非同步）",
-    description="將音訊檔案、多張背景圖片與 SRT 字幕合成視覺化影片，支援字幕樣式自訂。此 API 為非同步處理，會立即回傳任務 ID。"
+    description="""
+參數說明：
+- audio (UploadFile, 必填)：音訊檔案
+- image_directory (str, 必填)：圖片目錄名稱（相對於 image_storage 目錄），自動抓取該目錄下所有圖片（支援 jpg、jpeg、png、gif、webp）
+- image_limit (int, 選填)：要抓取的圖片張數（預設全部）
+- font_dir (str, 選填)：字型目錄名稱（相對於 image_storage，可選），自動抓取 ttf/otf 檔案，優先使用第一個找到的字型
+- subtitle (UploadFile, 必填)：字幕檔案（SRT）
+- output_format (str, 預設mp4)：輸出影片格式
+- width (int, 預設1920)：影片寬度
+- height (int, 預設1080)：影片高度
+- image_duration (float, 預設5)：每張圖片顯示秒數
+- visualization_type (str, 預設waveform)：視覺化類型（waveform/spectrum）
+- wave_mode (str, 預設line)：波形模式
+- wave_color (str, 預設white)：波形顏色
+- spectrum_mode (str, 預設combined)：頻譜模式
+- spectrum_color (str, 預設intensity)：頻譜顏色
+- spectrum_scale (str, 預設log)：頻譜刻度
+- spectrum_saturation (float, 預設1.0)：頻譜飽和度
+- fps (int, 預設30)：幀率
+- opacity (float, 預設0.8)：視覺化圖層透明度
+- duration (float, 選填)：指定輸出影片長度
+
+字幕樣式參數同 /add_subtitle
+
+回傳：
+- 任務ID、狀態、查詢進度與下載結果的API
+"""
 )
 async def create_audio_visualization_with_subtitle(
     background_tasks: BackgroundTasks,
     audio: UploadFile = File(..., description="音訊檔案"),
-    backgrounds: List[UploadFile] = File([], description="多張背景圖片"),
+    image_directory: str = Query(..., description="圖片目錄名稱（相對於 image_storage 目錄）"),
+    image_limit: Optional[int] = Query(None, description="要抓取的圖片張數（預設全部）"),
+    font_dir: Optional[str] = Query(None, description="字型目錄名稱（相對於 image_storage，可選）"),
     subtitle: UploadFile = File(..., description="字幕檔案（SRT）"),
     output_format: str = "mp4",
     width: int = 1920,
@@ -977,36 +1123,62 @@ async def create_audio_visualization_with_subtitle(
     alignment: int = 2,
     duration: Optional[float] = None
 ):
-    # 驗證輸入參數
-    if not backgrounds:
-        raise HTTPException(status_code=400, detail="請至少上傳一張背景圖片")
+    import glob
+    import aiofiles
+    import shutil
+    import os
 
     # 生成任務 ID
     task_id = str(uuid.uuid4())
-    
-    # 建立任務工作目錄
     task_dir = os.path.join(TASK_OUTPUT_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
-    
-    # 儲存上傳的檔案
+
+    # 儲存音訊與字幕
     audio_path = os.path.join(task_dir, f"audio{os.path.splitext(audio.filename)[1]}")
     subtitle_path = os.path.join(task_dir, f"subtitle{os.path.splitext(subtitle.filename)[1]}")
-    
-    # 儲存檔案
     async with aiofiles.open(audio_path, 'wb') as f:
         await f.write(await audio.read())
     async with aiofiles.open(subtitle_path, 'wb') as f:
         await f.write(await subtitle.read())
-    
-    # 儲存背景圖片
+
+    # 只從 image_directory 目錄抓圖
+    dir_path = os.path.join(IMAGE_STORAGE_DIR, image_directory)
+    if not os.path.exists(dir_path):
+        raise HTTPException(status_code=404, detail=f"找不到指定的圖片目錄: {image_directory}")
+    image_files = []
+    for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+        image_files.extend(glob.glob(os.path.join(dir_path, f'*{ext}')))
+    image_files = sorted(image_files)
+    if not image_files:
+        raise HTTPException(status_code=400, detail=f"在目錄 {image_directory} 中找不到圖片檔案")
+    if image_limit is not None:
+        image_files = image_files[:image_limit]
     background_paths = []
-    for i, bg in enumerate(backgrounds):
-        bg_path = os.path.join(task_dir, f"bg_{i}{os.path.splitext(bg.filename)[1]}")
-        async with aiofiles.open(bg_path, 'wb') as f:
-            await f.write(await bg.read())
-        background_paths.append(bg_path)
-    
-    # 儲存任務參數
+    for i, img_path in enumerate(image_files):
+        new_path = os.path.join(task_dir, f"img_{i}{os.path.splitext(img_path)[1]}")
+        shutil.copy2(img_path, new_path)
+        background_paths.append(new_path)
+    if not background_paths:
+        raise HTTPException(status_code=400, detail="請至少上傳一張背景圖片或指定圖片目錄")
+
+    # 處理字型檔案
+    fontfile_path = None
+    if font_dir:
+        font_dir_path = os.path.join(IMAGE_STORAGE_DIR, font_dir)
+        if os.path.isfile(font_dir_path) and font_dir_path.lower().endswith(('.ttf', '.otf')):
+            fontfile_path = os.path.abspath(font_dir_path).replace("\\", "/")
+        elif os.path.isdir(font_dir_path):
+            font_files = []
+            for ext in ['.ttf', '.otf']:
+                font_files.extend(glob.glob(os.path.join(font_dir_path, f'*{ext}')))
+            if font_files:
+                fontfile_path = os.path.abspath(font_files[0]).replace("\\", "/")
+            else:
+                raise HTTPException(status_code=400, detail=f"在字型目錄 {font_dir} 中找不到 ttf/otf 字型檔案")
+        else:
+            raise HTTPException(status_code=400, detail=f"字型目錄 {font_dir} 不存在或不是資料夾/檔案")
+
+    # 任務參數
     task_params = {
         "audio_path": audio_path,
         "subtitle_path": subtitle_path,
@@ -1041,9 +1213,13 @@ async def create_audio_visualization_with_subtitle(
         "margin_vertical": margin_vertical,
         "alignment": alignment,
         "duration": duration,
-        "task_dir": task_dir
+        "task_dir": task_dir,
+        "fontfile_path": fontfile_path,
+        "font_dir": font_dir,
+        "image_directory": image_directory,
+        "image_limit": image_limit,
     }
-    
+
     # 初始化任務狀態
     tasks[task_id] = {
         "status": TaskStatus.PENDING,
@@ -1054,8 +1230,8 @@ async def create_audio_visualization_with_subtitle(
         "created_at": datetime.now().isoformat(),
         "completed_at": None
     }
-    
-    # 在背景執行任務
+
+    # 啟動背景任務
     background_tasks.add_task(process_visualization_task, task_id)
     
     return JSONResponse({
@@ -1198,48 +1374,37 @@ async def process_visualization_task(task_id: str):
         await process.communicate()
         
         if process.returncode != 0:
-            raise Exception("音訊視覺化影片生成失敗")
+            error_detail = stderr.decode(errors="ignore")
+            print(f"FFmpeg error: {error_detail}")
+            raise Exception(f"音訊視覺化影片生成失敗: {error_detail}")
         
-        # 加入字幕
+        # 加入字幕（完全比照 create_video_with_subtitle_async，不用 fontfile 參數）
         tasks[task_id]["progress"] = 70
-        safe_subtitle_path = params["subtitle_path"].replace('\\', '/').replace(':', '\\:')
-        
-        filter_complex = (
-            f"subtitles={safe_subtitle_path}"
-            f":force_style='"
-            f"Fontname={params['font_name']},"
-            f"FontSize={params['font_size']},"
-            f"PrimaryColour=&H{font_color_to_ass_color(params['font_color'], params['font_alpha'])},"
-            f"OutlineColour=&H{font_color_to_ass_color(params['border_color'], params['border_alpha'])},"
-            f"BackColour=&H{font_color_to_ass_color(params['background_color'], params['background_alpha'])},"
-            f"BorderStyle={params['border_style']},"
-            f"Outline={params['border_size']},"
-            f"Shadow={params['shadow_size']},"
-            f"MarginV={params['margin_vertical']},"
-            f"Alignment={params['alignment']},"
-            f"Bold=1,"
-            f"BackColour=&H{font_color_to_ass_color(params['background_color'], params['background_alpha'])}'"
-        )
-        
-        cmd = [
+        safe_subtitle_path = escape_ffmpeg_path(os.path.abspath(params["subtitle_path"]))
+        style_str = build_force_style(params)
+        filter_complex_sub = f"subtitles='{safe_subtitle_path}':force_style='{style_str}'"
+        print("DEBUG filter_complex_sub:", filter_complex_sub)
+        cmd2 = [
             'ffmpeg',
             '-i', temp_video_path,
-            '-vf', filter_complex,
+            '-vf', filter_complex_sub,
             '-c:v', 'libx264',
             '-c:a', 'copy',
             '-y',
             output_path
         ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
+        process2 = await asyncio.create_subprocess_exec(
+            *cmd2,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await process.communicate()
-        
-        if process.returncode != 0:
-            raise Exception("字幕加入失敗")
+        stdout, stderr = await process2.communicate()
+        error_msg = stderr.decode(errors="ignore")
+        if process2.returncode != 0 or not os.path.exists(output_path):
+            print(f"FFmpeg error: {error_msg}")
+            print(f"Filter complex: {filter_complex_sub}")
+            print(f"Subtitle path: {safe_subtitle_path}")
+            raise Exception(f"字幕加入失敗: {error_msg}")
         
         # 更新任務狀態為完成
         tasks[task_id].update({
@@ -1359,7 +1524,19 @@ def create_visualization_command(
 
 @app.post("/separate_vocals",
     summary="音訊人聲分離",
-    description="使用 FFmpeg 濾鏡進行人聲分離處理"
+    description="""
+參數說明：
+- audio (UploadFile, 必填)：要進行人聲分離的音訊檔案
+- output_format (str, 預設mp3)：輸出格式
+- vocal_type (str, 預設vocals)：選擇輸出人聲或伴奏（vocals/instrumental）
+- high_freq (int, 預設4000)：高通濾波器頻率
+- low_freq (int, 預設300)：低通濾波器頻率
+- center_boost (float, 預設2.0)：中央聲道增強係數
+- side_reduction (float, 預設0.7)：側聲道降低係數
+
+回傳：
+- 分離後的音訊檔案
+"""
 )
 async def separate_vocals(
     audio: UploadFile = File(..., description="要進行人聲分離的音訊檔案"),
@@ -1478,12 +1655,56 @@ async def separate_vocals(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/create_video_with_subtitle_async",
-    summary="非同步：多圖合成影片並加字幕",
-    description="將多張圖片與多個音樂、字幕合成影片後再加上字幕，支援非同步任務查詢與下載。"
+    summary="非同步：目錄多圖合成影片並加字幕",
+    description="""
+參數說明：
+- image_directory (str, 必填): 圖片目錄名稱，自動抓取該目錄下所有圖片（支援 jpg、jpeg、png、gif、webp）
+- image_limit (int, 選填): 要抓取的圖片張數（預設全部）
+- font_name (str, 選填): 字型名稱（如 Arial、微軟正黑體等，預設 Arial）
+- font_dir (str, 選填): 字型目錄名稱（可選），自動抓取 ttf/otf 檔案，優先使用第一個找到的字型
+- audios (List[UploadFile], 必填): 多個背景音樂檔案，會自動串接
+- subtitles (List[UploadFile], 必填): 多個字幕檔案（SRT），會自動合併
+- duration_per_image (float, 預設5): 每張圖片顯示秒數
+- output_format (str, 預設mp4): 輸出影片格式（mp4、mov、webm等）
+- width (int, 預設1920): 輸出影片寬度
+- height (int, 預設1080): 輸出影片高度
+- fade_duration (float, 預設1): 淡入淡出時間（秒）
+- transition_type (str, 預設fade): 轉場效果類型（fade、dissolve、wipeleft、wiperight、wipeup、wipedown、circleopen、circleclose、pixelize、random）
+- transition_duration (float, 預設2): 轉場效果持續時間（秒）
+
+字幕樣式參數:
+- font_size (int, 預設24): 字型大小
+- font_color (str, 預設white): 字型顏色
+- font_alpha (float, 預設1.0): 字型透明度 (0~1)
+- border_style (int, 預設3): 邊框樣式
+- border_size (int, 預設1): 邊框大小
+- border_color (str, 預設black): 邊框顏色
+- border_alpha (float, 預設1.0): 邊框透明度 (0~1)
+- shadow_size (int, 預設2): 陰影大小
+- shadow_color (str, 預設black): 陰影顏色
+- shadow_alpha (float, 預設0.5): 陰影透明度 (0~1)
+- background (bool, 預設True): 是否顯示字幕背景
+- background_color (str, 預設black): 字幕背景顏色
+- background_alpha (float, 預設0.5): 字幕背景透明度 (0~1)
+- margin_vertical (int, 預設20): 字幕垂直邊距
+- alignment (int, 預設2): 字幕對齊方式 (1~9，2為底部置中)
+
+回傳:
+- 任務ID、狀態、查詢進度與下載結果的API
+
+注意事項:
+1. 圖片來源僅支援目錄，請先用 /upload_image 上傳圖片到指定目錄
+2. 音樂與字幕可多檔上傳，會自動串接/合併
+3. 任務為非同步，請用回傳的 task_id 查詢進度與下載
+4. 若有指定 font_dir，會自動使用該目錄下的 ttf/otf 字型檔案
+"""
 )
 async def create_video_with_subtitle_async(
     background_tasks: BackgroundTasks,
-    images: List[UploadFile] = File(..., description="要合成的圖片檔案列表"),
+    image_directory: str = Query(..., description="圖片目錄名稱（相對於 image_storage）"),
+    image_limit: Optional[int] = Query(None, description="要抓取的圖片張數（預設全部）"),
+    font_name: str = Query("Arial", description="字型名稱（如 Arial、微軟正黑體等，預設 Arial）"),
+    font_dir: Optional[str] = Query(None, description="字型目錄名稱（相對於 image_storage，可選）"),
     audios: List[UploadFile] = File(..., description="多個背景音樂檔案"),
     subtitles: List[UploadFile] = File(..., description="多個字幕檔案（SRT）"),
     duration_per_image: float = 5.0,
@@ -1491,10 +1712,9 @@ async def create_video_with_subtitle_async(
     width: int = 1920,
     height: int = 1080,
     fade_duration: float = 1.0,
-    transition_type: str = "fade",
+    transition_type: str = "fade",  # 可選 random
     transition_duration: float = 2.0,
-    # 字幕樣式
-    font_name: str = "Arial",
+    # 字幕樣式參數
     font_size: int = 24,
     font_color: str = "white",
     font_alpha: float = 1.0,
@@ -1511,22 +1731,31 @@ async def create_video_with_subtitle_async(
     margin_vertical: int = 20,
     alignment: int = 2
 ):
-    """
-    非同步多圖合成影片並加字幕 API（支援多音樂、多字幕串接）
-    """
-    import aiofiles
-    import tempfile
     # 產生任務 ID 與目錄
+    import glob
     task_id = str(uuid.uuid4())
     task_dir = os.path.join(TASK_OUTPUT_DIR, task_id)
     os.makedirs(task_dir, exist_ok=True)
-    # 儲存圖片
+
+    # 只抓取目錄圖片
+    dir_path = os.path.join(IMAGE_STORAGE_DIR, image_directory)
+    if not os.path.exists(dir_path):
+        raise HTTPException(status_code=404, detail=f"找不到指定的圖片目錄: {image_directory}")
+    image_files = []
+    for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+        image_files.extend(glob.glob(os.path.join(dir_path, f'*{ext}')))
+    image_files = sorted(image_files)
+    if not image_files:
+        raise HTTPException(status_code=400, detail=f"在目錄 {image_directory} 中找不到圖片檔案")
+    # 新增：只取前 image_limit 張
+    if image_limit is not None:
+        image_files = image_files[:image_limit]
     image_paths = []
-    for i, img in enumerate(images):
-        img_path = os.path.join(task_dir, f"img_{i}{os.path.splitext(img.filename)[1]}")
-        async with aiofiles.open(img_path, 'wb') as f:
-            await f.write(await img.read())
-        image_paths.append(img_path)
+    for i, img_path in enumerate(image_files):
+        new_path = os.path.join(task_dir, f"img_{i}{os.path.splitext(img_path)[1]}")
+        shutil.copy2(img_path, new_path)
+        image_paths.append(new_path)
+
     # 儲存多個音樂
     audio_paths = []
     for i, audio in enumerate(audios):
@@ -1535,14 +1764,10 @@ async def create_video_with_subtitle_async(
         async with aiofiles.open(audio_path, 'wb') as f:
             await f.write(content)
         audio_paths.append(audio_path)
-    # 檢查檔案都存在且有內容
-    for p in audio_paths:
-        if not os.path.exists(p) or os.path.getsize(p) == 0:
-            raise HTTPException(status_code=400, detail=f"音樂檔案不存在或為空: {p}")
+
     # 串接音樂
     concat_audio_path = os.path.join(task_dir, "concat_audio.mp3")
     if len(audio_paths) == 1:
-        import shutil
         shutil.copy(audio_paths[0], concat_audio_path)
     else:
         concat_list_path = os.path.join(task_dir, "concat_list.txt")
@@ -1550,15 +1775,14 @@ async def create_video_with_subtitle_async(
             for p in audio_paths:
                 abs_path = os.path.abspath(p).replace("\\", "/")
                 f.write(f"file '{abs_path}'\n")
-        if not os.path.exists(concat_list_path):
-            raise HTTPException(status_code=500, detail="concat_list.txt 未正確產生")
-        import subprocess
         cmd = [
-            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy', concat_audio_path
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', 
+            '-i', concat_list_path, '-c', 'copy', concat_audio_path
         ]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if result.returncode != 0 or not os.path.exists(concat_audio_path):
+        if result.returncode != 0:
             raise HTTPException(status_code=500, detail=f"音樂串接失敗: {result.stderr.decode()}")
+
     # 儲存多個字幕並合併
     merged_subtitle_path = os.path.join(task_dir, "merged_subtitle.srt")
     async with aiofiles.open(merged_subtitle_path, 'wb') as merged_f:
@@ -1566,7 +1790,35 @@ async def create_video_with_subtitle_async(
             content = await subtitle.read()
             await merged_f.write(content)
             if i < len(subtitles) - 1:
-                await merged_f.write(b"\n")  # 分隔
+                await merged_f.write(b"\n")
+
+    # 處理字型檔案
+    fontfile_path = None
+    if font_dir:
+        font_dir_path = os.path.join(IMAGE_STORAGE_DIR, font_dir)
+        # 如果是檔案就直接用
+        if os.path.isfile(font_dir_path) and font_dir_path.lower().endswith(('.ttf', '.otf')):
+            fontfile_path = os.path.abspath(font_dir_path).replace("\\", "/")
+        # 否則當作目錄
+        elif os.path.isdir(font_dir_path):
+            font_files = []
+            for ext in ['.ttf', '.otf']:
+                font_files.extend(glob.glob(os.path.join(font_dir_path, f'*{ext}')))
+            if font_files:
+                fontfile_path = os.path.abspath(font_files[0]).replace("\\", "/")
+            else:
+                raise HTTPException(status_code=400, detail=f"在字型目錄 {font_dir} 中找不到 ttf/otf 字型檔案")
+        else:
+            raise HTTPException(status_code=400, detail=f"字型目錄 {font_dir} 不存在或不是資料夾/檔案")
+
+    # 修正 font_name 只取名稱不含副檔名
+    if font_name.lower().endswith(('.ttf', '.otf')):
+        font_name = os.path.splitext(font_name)[0]
+
+    # 修正 font_dir 只取最後一層資料夾名稱
+    if font_dir and (os.path.isabs(font_dir) or "\\" in font_dir or "/" in font_dir):
+        font_dir = os.path.basename(font_dir.rstrip("\\/"))
+
     # 任務參數
     task_params = {
         "image_paths": image_paths,
@@ -1579,7 +1831,6 @@ async def create_video_with_subtitle_async(
         "fade_duration": fade_duration,
         "transition_type": transition_type,
         "transition_duration": transition_duration,
-        "font_name": font_name,
         "font_size": font_size,
         "font_color": font_color,
         "font_alpha": font_alpha,
@@ -1595,8 +1846,12 @@ async def create_video_with_subtitle_async(
         "background_alpha": background_alpha,
         "margin_vertical": margin_vertical,
         "alignment": alignment,
-        "task_dir": task_dir
+        "fontfile_path": fontfile_path,
+        "task_dir": task_dir,
+        "font_name": font_name,
+        "font_dir": font_dir,
     }
+
     # 初始化任務狀態
     tasks[task_id] = {
         "status": TaskStatus.PENDING,
@@ -1607,8 +1862,10 @@ async def create_video_with_subtitle_async(
         "created_at": datetime.now().isoformat(),
         "completed_at": None
     }
+
     # 啟動背景任務
     background_tasks.add_task(process_video_with_subtitle_task, task_id)
+    
     return JSONResponse({
         "task_id": task_id,
         "status": TaskStatus.PENDING,
@@ -1627,21 +1884,62 @@ async def process_video_with_subtitle_task(task_id: str):
         # 建立 filter_complex 字串
         filter_complex = []
         for i, _ in enumerate(params["image_paths"]):
-            filter_complex.append(f"[{i}:v]scale={params['width']}:{params['height']}:force_original_aspect_ratio=decrease,pad={params['width']}:{params['height']}:(ow-iw)/2:(oh-ih)/2[scaled{i}];")
-            if params["transition_type"] == "fade":
+            filter_complex.append(
+                f"[{i}:v]scale={params['width']}:{params['height']}:force_original_aspect_ratio=1,"
+                f"pad={params['width']}:{params['height']}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"setsar=1[scaled{i}];"
+            )
+            
+            # 決定本張的轉場
+            if params["transition_type"] == "random":
+                this_transition = random.choice(["fade", "dissolve", "wipeleft", "wiperight", "wipeup", "wipedown", "circleopen", "circleclose", "pixelize"])
+            else:
+                this_transition = params["transition_type"]
+            # 下方原有的 if/elif 結構，全部用 this_transition 取代 params["transition_type"]
+            if this_transition == "fade":
+                # ...原有 fade 處理...
                 if i == 0:
                     filter_complex.append(f"[scaled{i}]fade=t=out:st={params['duration_per_image']-params['transition_duration']}:d={params['transition_duration']}[v{i}];")
                 elif i == len(params["image_paths"]) - 1:
                     filter_complex.append(f"[scaled{i}]fade=t=in:st=0:d={params['transition_duration']}[v{i}];")
                 else:
                     filter_complex.append(f"[scaled{i}]fade=t=in:st=0:d={params['transition_duration']},fade=t=out:st={params['duration_per_image']-params['transition_duration']}:d={params['transition_duration']}[v{i}];")
-            elif params["transition_type"] == "dissolve":
+            elif this_transition == "dissolve":
+                # ...原有 dissolve 處理...
                 if i == 0:
                     filter_complex.append(f"[scaled{i}]format=rgba,fade=t=out:st={params['duration_per_image']-params['transition_duration']}:d={params['transition_duration']}:alpha=1[v{i}];")
                 elif i == len(params["image_paths"]) - 1:
                     filter_complex.append(f"[scaled{i}]format=rgba,fade=t=in:st=0:d={params['transition_duration']}:alpha=1[v{i}];")
                 else:
                     filter_complex.append(f"[scaled{i}]format=rgba,fade=t=in:st=0:d={params['transition_duration']}:alpha=1,fade=t=out:st={params['duration_per_image']-params['transition_duration']}:d={params['transition_duration']}:alpha=1[v{i}];")
+            elif this_transition in ["wipeleft", "wiperight", "wipeup", "wipedown"]:
+                direction = {
+                    "wipeleft": "from_right",
+                    "wiperight": "from_left",
+                    "wipeup": "from_bottom",
+                    "wipedown": "from_top"
+                }[this_transition]
+                if i == 0:
+                    filter_complex.append(f"[scaled{i}]format=rgba,wipe={direction}:duration={params['transition_duration']}:t={params['duration_per_image']-params['transition_duration']}[v{i}];")
+                elif i == len(params["image_paths"]) - 1:
+                    filter_complex.append(f"[scaled{i}]format=rgba,wipe={direction}:duration={params['transition_duration']}:t=0[v{i}];")
+                else:
+                    filter_complex.append(f"[scaled{i}]format=rgba,wipe={direction}:duration={params['transition_duration']}:t=0,wipe={direction}:duration={params['transition_duration']}:t={params['duration_per_image']-params['transition_duration']}[v{i}];")
+            elif this_transition in ["circleopen", "circleclose"]:
+                mode = "out" if this_transition == "circleopen" else "in"
+                if i == 0:
+                    filter_complex.append(f"[scaled{i}]format=rgba,circle{mode}=duration={params['transition_duration']}:t={params['duration_per_image']-params['transition_duration']}[v{i}];")
+                elif i == len(params["image_paths"]) - 1:
+                    filter_complex.append(f"[scaled{i}]format=rgba,circle{mode}=duration={params['transition_duration']}:t=0[v{i}];")
+                else:
+                    filter_complex.append(f"[scaled{i}]format=rgba,circle{mode}=duration={params['transition_duration']}:t=0,circle{mode}=duration={params['transition_duration']}:t={params['duration_per_image']-params['transition_duration']}[v{i}];")
+            elif this_transition == "pixelize":
+                if i == 0:
+                    filter_complex.append(f"[scaled{i}]format=rgba,pixelize=amount=10:duration={params['transition_duration']}:t={params['duration_per_image']-params['transition_duration']}[v{i}];")
+                elif i == len(params["image_paths"]) - 1:
+                    filter_complex.append(f"[scaled{i}]format=rgba,pixelize=amount=10:duration={params['transition_duration']}:t=0[v{i}];")
+                else:
+                    filter_complex.append(f"[scaled{i}]format=rgba,pixelize=amount=10:duration={params['transition_duration']}:t=0,pixelize=amount=10:duration={params['transition_duration']}:t={params['duration_per_image']-params['transition_duration']}[v{i}];")
         video_inputs = ''.join(f'[v{i}]' for i in range(len(params["image_paths"])))
         filter_complex.append(f"{video_inputs}concat=n={len(params['image_paths'])}:v=1:a=0[outv]")
         filter_complex_str = ''.join(filter_complex)
@@ -1672,29 +1970,18 @@ async def process_video_with_subtitle_task(task_id: str):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await process.communicate()
+        stdout, stderr = await process.communicate()
         if process.returncode != 0 or not os.path.exists(video_path):
-            raise Exception("合成影片失敗")
+            # 這裡加上詳細錯誤訊息
+            error_detail = stderr.decode(errors="ignore")
+            raise Exception(f"合成影片失敗: {error_detail}")
         tasks[task_id]["progress"] = 60
         # 2. 加字幕
         output_path = os.path.join(params["task_dir"], f"output.{params['output_format']}")
-        safe_subtitle_path = params["subtitle_path"].replace('\\', '/').replace(':', '\\:')
-        filter_complex_sub = (
-            f"subtitles={safe_subtitle_path}"
-            f":force_style='"
-            f"Fontname={params['font_name']},"
-            f"FontSize={params['font_size']},"
-            f"PrimaryColour=&H{font_color_to_ass_color(params['font_color'], params['font_alpha'])},"
-            f"OutlineColour=&H{font_color_to_ass_color(params['border_color'], params['border_alpha'])},"
-            f"BackColour=&H{font_color_to_ass_color(params['background_color'], params['background_alpha'])},"
-            f"BorderStyle={params['border_style']},"
-            f"Outline={params['border_size']},"
-            f"Shadow={params['shadow_size']},"
-            f"MarginV={params['margin_vertical']},"
-            f"Alignment={params['alignment']},"
-            f"Bold=1,"
-            f"BackColour=&H{font_color_to_ass_color(params['background_color'], params['background_alpha'])}'"
-        )
+        safe_subtitle_path = escape_ffmpeg_path(os.path.abspath(params["subtitle_path"]))
+        style_str = build_force_style(params)
+        filter_complex_sub = f"subtitles='{safe_subtitle_path}':force_style='{style_str}'"
+        print("DEBUG filter_complex_sub:", filter_complex_sub)
         cmd2 = [
             'ffmpeg',
             '-i', video_path,
@@ -1709,9 +1996,14 @@ async def process_video_with_subtitle_task(task_id: str):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        await process2.communicate()
+        stdout, stderr = await process2.communicate()
+        stderr_msg = stderr.decode(errors="ignore")
         if process2.returncode != 0 or not os.path.exists(output_path):
-            raise Exception("加字幕失敗")
+           error_msg = stderr.decode(errors="ignore")
+           print(f"FFmpeg error: {error_msg}")
+           print(f"Filter complex: {filter_complex_sub}")
+           print(f"Subtitle path: {safe_subtitle_path}")
+           raise Exception(f"加字幕失敗: {error_msg}")
         tasks[task_id].update({
             "status": TaskStatus.COMPLETED,
             "output_path": output_path,
@@ -1734,7 +2026,13 @@ async def process_video_with_subtitle_task(task_id: str):
 
 @app.post("/get_audio_duration",
     summary="取得音檔秒數",
-    description="上傳mp3音檔，回傳音檔的總秒數"
+    description="""
+參數說明：
+- audio (UploadFile, 必填)：音訊檔案（mp3）
+
+回傳：
+- duration (float)：音檔長度（秒）
+"""
 )
 async def get_audio_duration(
     audio: UploadFile = File(..., description="音訊檔案（mp3）")
@@ -1773,9 +2071,163 @@ async def get_audio_duration(
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+@app.post("/upload_image",
+    summary="上傳圖片到指定目錄",
+    description="""
+參數說明：
+- file (UploadFile, 必填)：要上傳的圖片檔案
+- directory (str, 選填)：子目錄名稱
+- filename (str, 選填)：自訂檔名
+
+回傳：
+- file_path：檔案的相對路徑
+- filename：檔案名稱
+"""
+)
+async def upload_image(
+    file: UploadFile = File(..., description="要上傳的圖片檔案"),
+    directory: str = "",  # 可選的子目錄
+    filename: Optional[str] = None  # 可選的自訂檔名
+):
+    """
+    上傳圖片 API
+    
+    參數說明：
+    - file: 要上傳的圖片檔案
+    - directory: 子目錄名稱（可選）
+    - filename: 自訂檔名（可選，不指定則使用原始檔名）
+    
+    回傳：
+    - file_path: 檔案的相對路徑
+    - filename: 檔案名稱
+    """
+    try:
+        # 驗證檔案類型
+        content_type = file.content_type
+        if not content_type or not content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="只能上傳圖片檔案")
+
+        # 建立目標目錄
+        target_dir = os.path.join(IMAGE_STORAGE_DIR, directory)
+        os.makedirs(target_dir, exist_ok=True)
+
+        # 決定檔案名稱
+        if filename:
+            # 確保檔案名稱有副檔名
+            if not os.path.splitext(filename)[1]:
+                original_ext = os.path.splitext(file.filename)[1]
+                filename = f"{filename}{original_ext}"
+        else:
+            filename = file.filename
+
+        # 確保檔案名稱唯一
+        base_name, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(os.path.join(target_dir, filename)):
+            filename = f"{base_name}_{counter}{ext}"
+            counter += 1
+
+        # 儲存檔案
+        file_path = os.path.join(target_dir, filename)
+        async with aiofiles.open(file_path, 'wb') as f:
+            content = await file.read()
+            await f.write(content)
+
+        # 回傳相對路徑
+        relative_path = os.path.relpath(file_path, IMAGE_STORAGE_DIR)
+        return {
+            "file_path": relative_path,
+            "filename": filename
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/download_image/{path:path}",
+    summary="下載指定目錄的圖片",
+    description="""
+參數說明：
+- path (str, 必填)：圖片的相對路徑（相對於 image_storage 目錄）
+
+回傳：
+- 圖片檔案
+"""
+)
+async def download_image(path: str):
+    """
+    下載圖片 API
+    
+    參數說明：
+    - path: 圖片的相對路徑（相對於 image_storage 目錄）
+    
+    回傳：
+    - 圖片檔案
+    """
+    try:
+        # 組合完整路徑
+        full_path = os.path.join(IMAGE_STORAGE_DIR, path)
+        
+        # 檢查路徑是否在允許的目錄內
+        if not os.path.abspath(full_path).startswith(os.path.abspath(IMAGE_STORAGE_DIR)):
+            raise HTTPException(status_code=403, detail="不允許存取此路徑")
+
+        # 檢查檔案是否存在
+        if not os.path.exists(full_path):
+            raise HTTPException(status_code=404, detail="找不到指定的檔案")
+
+        # 檢查是否為圖片檔案
+        content_type = None
+        ext = os.path.splitext(full_path)[1].lower()
+        if ext in ['.jpg', '.jpeg']:
+            content_type = 'image/jpeg'
+        elif ext == '.png':
+            content_type = 'image/png'
+        elif ext == '.gif':
+            content_type = 'image/gif'
+        elif ext == '.webp':
+            content_type = 'image/webp'
+        else:
+            raise HTTPException(status_code=400, detail="不支援的檔案類型")
+
+        # 回傳檔案
+        return FileResponse(
+            path=full_path,
+            media_type=content_type,
+            filename=os.path.basename(full_path)
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def escape_ffmpeg_path(path: str) -> str:
+    # Windows 路徑冒號要跳脫
+    path = path.replace("\\", "/")
+    if ":" in path:
+        drive, rest = path.split(":", 1)
+        return f"{drive}\\:{rest}"
+    return path
+
+def build_force_style(params):
+    # force_style 內部用 \: 分隔，字串屬性加雙引號
+    return (
+        f'Fontname="{params["font_name"]}"\\:'
+        f'FontSize={params["font_size"]}\\:'
+        f'PrimaryColour=&H{font_color_to_ass_color(params["font_color"], params["font_alpha"])}\\:'
+        f'OutlineColour=&H{font_color_to_ass_color(params["border_color"], params["border_alpha"])}\\:'
+        f'BackColour=&H{font_color_to_ass_color(params["background_color"], params["background_alpha"])}\\:'
+        f'BorderStyle={params["border_style"]}\\:'
+        f'Outline={params["border_size"]}\\:'
+        f'Shadow={params["shadow_size"]}\\:'
+        f'MarginV={params["margin_vertical"]}\\:'
+        f'Alignment={params["alignment"]}\\:'
+        f'Bold=1'
+    )
+
 if __name__ == "__main__":
     # 從環境變數獲取端口，如果沒有則使用預設值
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 5000))
     
     # 在生產環境中使用 0.0.0.0 作為 host
     uvicorn.run(
