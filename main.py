@@ -857,203 +857,6 @@ async def create_spectrogram(
             os.remove(output_path)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/create_audio_visualization",
-    summary="產生音訊視覺化與多圖背景合成",
-    description="""
-參數說明：
-- audio (UploadFile, 必填)：音訊檔案
-- backgrounds (List[UploadFile], 必填)：多張背景圖片
-- output_format (str, 預設mp4)：輸出影片格式
-- width (int, 預設1920)：影片寬度
-- height (int, 預設1080)：影片高度
-- image_duration (float, 預設5)：每張圖片顯示秒數
-- visualization_type (str, 預設waveform)：視覺化類型（waveform/spectrum）
-- wave_mode (str, 預設line)：波形模式
-- wave_color (str, 預設white)：波形顏色
-- spectrum_mode (str, 預設combined)：頻譜模式
-- spectrum_color (str, 預設intensity)：頻譜顏色
-- spectrum_scale (str, 預設log)：頻譜刻度
-- spectrum_saturation (float, 預設1.0)：頻譜飽和度
-- fps (int, 預設30)：幀率
-- opacity (float, 預設0.8)：視覺化圖層透明度
-- duration (float, 選填)：指定輸出影片長度
-
-回傳：
-- 音訊視覺化影片
-"""
-)
-async def create_audio_visualization(
-    audio: UploadFile = File(..., description="音訊檔案"),
-    backgrounds: List[UploadFile] = File(..., description="多張背景圖片"),
-    output_format: str = "mp4",
-    width: int = 1920,
-    height: int = 1080,
-    image_duration: float = 5.0,
-    visualization_type: str = "waveform",  # waveform, spectrum
-    wave_mode: str = "line",
-    wave_color: str = "white",
-    spectrum_mode: str = "combined",
-    spectrum_color: str = "intensity",
-    spectrum_scale: str = "log",
-    spectrum_saturation: float = 1.0,
-    fps: int = 30,
-    opacity: float = 0.8,
-    duration: Optional[float] = None
-):
-    temp_image_dir = os.path.join(UPLOAD_DIR, str(uuid.uuid4()))
-    os.makedirs(temp_image_dir, exist_ok=True)
-    audio_path = None
-    output_path = None
-    bg_video_path = None
-    try:
-        # 儲存音訊檔案
-        audio_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}{os.path.splitext(audio.filename)[1]}")
-        with open(audio_path, "wb") as buffer:
-            content = await audio.read()
-            buffer.write(content)
-
-        # 儲存多張圖片
-        image_files = []
-        for i, img in enumerate(backgrounds):
-            img_path = os.path.join(temp_image_dir, f"img_{i:04d}{os.path.splitext(img.filename)[1]}")
-            with open(img_path, "wb") as buffer:
-                content = await img.read()
-                buffer.write(content)
-            image_files.append(img_path)
-
-        if not image_files:
-            raise Exception("未上傳任何背景圖片")
-
-        # 生成背景影片
-        bg_video_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.mp4")
-        
-        # 建立 filter_complex
-        filter_parts = []
-        
-        # 處理每張圖片的縮放
-        for i in range(len(image_files)):
-            filter_parts.append(f"[{i}:v]scale={width}:{height},setsar=1[scaled{i}]")
-        
-        # 建立串接指令
-        concat_inputs = "".join(f"[scaled{i}]" for i in range(len(image_files)))
-        filter_parts.append(f"{concat_inputs}concat=n={len(image_files)}:v=1:a=0[outv]")
-        
-        # 組合完整的 filter_complex
-        filter_complex = ";".join(filter_parts)
-        
-        # 建立輸入檔案列表
-        input_files = []
-        for img_path in image_files:
-            input_files.extend(["-loop", "1", "-t", str(image_duration), "-i", img_path])
-        
-        # 執行 FFmpeg 命令生成背景影片
-        cmd = [
-            "ffmpeg", "-y",
-            *input_files,
-            "-filter_complex", filter_complex,
-            "-map", "[outv]",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-shortest",
-            bg_video_path
-        ]
-        
-        print("Debug - FFmpeg command:", " ".join(cmd))  # 除錯用
-        print("Debug - Filter complex:", filter_complex)  # 除錯用
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            error_msg = stderr.decode()
-            print(f"FFmpeg stderr: {error_msg}")
-            raise Exception(f"背景影片生成失敗: {error_msg}")
-
-        if not os.path.exists(bg_video_path):
-            raise Exception("背景影片檔案未生成")
-
-        # 生成音訊視覺化
-        output_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.{output_format}")
-        cmd = create_visualization_command(
-            audio_path=audio_path,
-            background_path=bg_video_path,
-            output_path=output_path,
-            width=width,
-            height=height,
-            visualization_type=visualization_type,
-            wave_mode=wave_mode,
-            wave_color=wave_color,
-            spectrum_mode=spectrum_mode,
-            spectrum_color=spectrum_color,
-            spectrum_scale=spectrum_scale,
-            spectrum_saturation=spectrum_saturation,
-            fps=fps,
-            opacity=opacity,
-            duration=duration
-        )
-
-        # 執行命令
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        stdout, stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            error_detail = stderr.decode(errors="ignore")
-            print(f"FFmpeg error: {error_detail}")
-            raise Exception(f"音訊視覺化影片生成失敗: {error_detail}")
-
-        # 檢查輸出檔案
-        if not os.path.exists(output_path):
-            raise Exception("輸出檔案未生成")
-
-        # 產生下載檔名
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"audio_visualization_{timestamp}.{output_format}"
-
-        response = FileResponse(
-            path=output_path,
-            media_type='video/mp4',
-            filename=output_filename
-        )
-
-        # 回應完成後自動刪除檔案
-        async def cleanup():
-            if os.path.exists(output_path):
-                os.remove(output_path)
-        response.background = BackgroundTask(cleanup)
-        return response
-
-    except Exception as e:
-        # 發生錯誤時清理所有臨時檔案
-        cleanup_files = [
-            audio_path,
-            bg_video_path,
-            *([output_path] if 'output_path' in locals() else [])
-        ]
-        
-        for file_path in cleanup_files:
-            try:
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
-            except Exception as cleanup_error:
-                print(f"清理檔案 {file_path} 時發生錯誤: {str(cleanup_error)}")
-        
-        if 'temp_image_dir' in locals() and os.path.exists(temp_image_dir):
-            try:
-                shutil.rmtree(temp_image_dir)
-            except Exception as cleanup_error:
-                print(f"清理目錄 {temp_image_dir} 時發生錯誤: {str(cleanup_error)}")
-        
-        raise Exception(f"生成音訊視覺化影片時發生錯誤: {str(e)}")
-
 @app.post("/create_audio_visualization_with_subtitle",
     summary="產生音訊視覺化、多圖背景與字幕合成（非同步）",
     description="""
@@ -1672,7 +1475,7 @@ async def separate_vocals(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/create_video_with_subtitle_async",
-    summary="非同步：目錄多圖合成影片並加字幕",
+    summary="目錄多圖合成影片並加字幕(非同步)",
     description="""
 參數說明：
 - image_directory (str, 必填): 圖片目錄名稱，自動抓取該目錄下所有圖片（支援 jpg、jpeg、png、gif、webp）
@@ -2270,111 +2073,6 @@ def build_album_force_style(params):
     return ",".join(style_parts)
 
 
-@app.post("/create_album_visualization", summary="專輯風格音樂視覺化")
-async def create_album_visualization(
-    audio: UploadFile = File(..., description="音樂檔案"),
-    image: UploadFile = File(..., description="主圖"),
-    subtitle: UploadFile = File(..., description="字幕檔（SRT/ASS）"),
-    output_format: str = "mp4",
-    width: int = 1920,
-    height: int = 1080,
-    blur: int = 40,
-    waveform_color: str = "white",
-    font_name: str = "Arial",
-    font_size: int = 36,
-    font_color: str = "white",
-    border_style: int = 3,
-    border_size: int = 2,
-    border_color: str = "black",
-    margin_vertical: int = 20,
-    alignment: int = 2
-):
-    temp_dir = f"temp/{uuid.uuid4()}"
-    os.makedirs(temp_dir, exist_ok=True)
-
-    try:
-        # 儲存檔案
-        audio_ext = os.path.splitext(audio.filename)[1]
-        image_ext = os.path.splitext(image.filename)[1]
-        subtitle_ext = os.path.splitext(subtitle.filename)[1].lower()
-
-        audio_path = os.path.join(temp_dir, f"audio{audio_ext}")
-        image_path = os.path.join(temp_dir, f"image{image_ext}")
-        subtitle_path = os.path.join(temp_dir, f"subtitle{subtitle_ext}")
-        output_path = os.path.join(temp_dir, f"output.{output_format}")
-
-        with open(audio_path, "wb") as f:
-            f.write(await audio.read())
-        with open(image_path, "wb") as f:
-            f.write(await image.read())
-        with open(subtitle_path, "wb") as f:
-            f.write(await subtitle.read())
-
-        # 修正路徑格式
-        subtitle_path = os.path.abspath(subtitle_path).replace("\\", "/")
-        image_path = os.path.abspath(image_path).replace("\\", "/")
-        audio_path = os.path.abspath(audio_path).replace("\\", "/")
-
-        filter_complex = (
-            f"[1:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},boxblur={blur}:1[bg];"
-            f"[1:v]scale=720:720:force_original_aspect_ratio=decrease,"
-            f"pad=720:720:(ow-iw)/2:(oh-ih)/2:color=white[mainimg];"
-            f"[bg][mainimg]overlay=(W-w)/2:(H-h)/2:format=auto[tmp];"
-            f"[0:a]showwaves=s={width}x200:mode=line:colors={waveform_color}:scale=sqrt:r=30[wave];"
-            f"[tmp][wave]overlay=0:H-200:format=auto[tmp2]"
-        )
-
-        # 字幕濾鏡處理
-        if subtitle_ext == ".srt":
-            filter_complex += f";[tmp2]subtitles='{subtitle_path}'[v]"
-        elif subtitle_ext == ".ass":
-            params = {
-                "font_name": font_name,
-                "font_size": font_size,
-                "font_color": font_color,
-                "border_style": border_style,
-                "border_size": border_size,
-                "border_color": border_color,
-                "margin_vertical": margin_vertical,
-                "alignment": alignment,
-                "shadow_size": 2,
-            }
-            style_str = build_album_force_style(params)
-            filter_complex += f";[tmp2]subtitles='{subtitle_path}':force_style='{style_str}'[v]"
-        else:
-            raise HTTPException(status_code=400, detail="僅支援 .srt 或 .ass 字幕檔案格式。")
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", audio_path,
-            "-i", image_path,
-            "-filter_complex", filter_complex,
-            "-map", "[v]",
-            "-map", "0:a",
-            "-c:v", "libx264",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-pix_fmt", "yuv420p",
-            "-shortest",
-            output_path
-        ]
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
-
-        if process.returncode != 0:
-            raise HTTPException(status_code=500, detail=stderr.decode(errors="ignore"))
-
-        return FileResponse(output_path, filename=f"album_visualization.{output_format}")
-
-    finally:
-        # 清理暫存資料夾
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
 async def process_album_visualization_task(task_id: str):
     """處理專輯視覺化任務的背景工作函數"""
@@ -2401,8 +2099,10 @@ async def process_album_visualization_task(task_id: str):
             f"[1:v]scale=720:720:force_original_aspect_ratio=decrease,"
             f"pad=720:720:(ow-iw)/2:(oh-ih)/2:color=white[mainimg];"
             f"[bg][mainimg]overlay=(W-w)/2:(H-h)/2:format=auto[tmp];"
-            f"[0:a]showwaves=s={params['width']}x200:mode=line:colors={params['waveform_color']}:scale=sqrt:r=30[wave];"
-            f"[tmp][wave]overlay=0:H-200:format=auto[tmp2]"
+            # 只保留 showwaves 支援的參數
+            f"[0:a]showwaves=s={params['width']}x{params['waveform_height']}:mode={params['waveform_mode']}:colors={params['waveform_color']}:r={params['waveform_speed']}[wave];"
+            f"[wave]format=rgba,colorchannelmixer=aa={params['waveform_opacity']}[wave_opacity];"
+            f"[tmp][wave_opacity]overlay=0:H-{params['waveform_height']}:format=auto[tmp2]"
         )
 
         # 字幕濾鏡處理
@@ -2478,7 +2178,40 @@ async def process_album_visualization_task(task_id: str):
         except Exception:
             pass
 
-@app.post("/create_album_visualization_async", summary="專輯風格音樂視覺化（非同步）")
+@app.post("/create_album_visualization_async", summary="專輯風格音樂視覺化（非同步）",
+    description="""
+參數說明：
+- audio (UploadFile, 必填)：音樂檔案
+- image (UploadFile, 必填)：主圖
+- subtitle (UploadFile, 必填)：字幕檔（SRT/ASS）
+- output_format (str, 預設mp4)：輸出影片格式
+- width (int, 預設1920)：影片寬度
+- height (int, 預設1080)：影片高度
+- blur (int, 預設40)：背景模糊強度
+- waveform_mode (str, 預設line)：波形模式（line/point/p2p/cline）
+- waveform_color (str, 預設white)：波形顏色
+- waveform_scale (str, 預設sqrt)：波形縮放（lin/log/sqrt）（目前未用於 showwaves）
+- waveform_saturation (float, 預設1.0)：波形飽和度（目前未用於 showwaves）
+- waveform_height (int, 預設200)：波形高度
+- waveform_opacity (float, 預設1.0)：波形透明度
+- waveform_speed (int, 預設30)：波形幀率
+- waveform_amplitude (float, 預設1.0)：波形振幅（目前未用於 showwaves）
+- waveform_center (bool, 預設True)：波形是否置中（目前未用於 showwaves）
+- font_name (str, 預設Arial)：字幕字型名稱
+- font_size (int, 預設36)：字幕字型大小
+- font_color (str, 預設white)：字幕字型顏色
+- border_style (int, 預設3)：字幕邊框樣式
+- border_size (int, 預設2)：字幕邊框大小
+- border_color (str, 預設black)：字幕邊框顏色
+- margin_vertical (int, 預設20)：字幕垂直邊距
+- alignment (int, 預設2)：字幕對齊方式
+
+回傳：
+- task_id (str)：任務 ID
+- status (str)：任務狀態
+- message (str)：提示訊息
+"""
+)
 async def create_album_visualization_async(
     background_tasks: BackgroundTasks,
     audio: UploadFile = File(..., description="音樂檔案"),
@@ -2488,7 +2221,15 @@ async def create_album_visualization_async(
     width: int = 1920,
     height: int = 1080,
     blur: int = 40,
+    waveform_mode: str = "line",  # line, point, p2p, cline
     waveform_color: str = "white",
+    waveform_scale: str = "sqrt",  # lin, log, sqrt
+    waveform_saturation: float = 1.0,
+    waveform_height: int = 200,
+    waveform_opacity: float = 1.0,
+    waveform_speed: int = 30,  # fps
+    waveform_amplitude: float = 1.0,  # 波形振幅
+    waveform_center: bool = True,  # 是否置中
     font_name: str = "Arial",
     font_size: int = 36,
     font_color: str = "white",
@@ -2529,7 +2270,15 @@ async def create_album_visualization_async(
             "width": width,
             "height": height,
             "blur": blur,
+            "waveform_mode": waveform_mode,
             "waveform_color": waveform_color,
+            "waveform_scale": waveform_scale,
+            "waveform_saturation": waveform_saturation,
+            "waveform_height": waveform_height,
+            "waveform_opacity": waveform_opacity,
+            "waveform_speed": waveform_speed,
+            "waveform_amplitude": waveform_amplitude,
+            "waveform_center": waveform_center,
             "font_name": font_name,
             "font_size": font_size,
             "font_color": font_color,
@@ -2555,7 +2304,21 @@ async def create_album_visualization_async(
         "message": "任務已提交，請使用任務 ID 查詢進度"
     })
 
-@app.get("/album_task/{task_id}", summary="查詢專輯視覺化任務狀態")
+@app.get("/album_task/{task_id}", summary="查詢專輯視覺化任務狀態",
+    description="""
+參數說明：
+- task_id (str, 必填)：任務 ID
+
+回傳：
+- status (str)：任務狀態（PENDING/PROCESSING/COMPLETED/FAILED）
+- progress (int)：進度百分比
+- created_at (str)：任務建立時間
+- download_url (str, 任務完成時)：下載連結
+- filename (str, 任務完成時)：檔案名稱
+- completed_at (str, 任務完成時)：完成時間
+- error (str, 任務失敗時)：錯誤訊息
+"""
+)
 async def get_album_task_status(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="找不到指定的任務")
@@ -2575,7 +2338,16 @@ async def get_album_task_status(task_id: str):
         response["error"] = task["error"]
     return JSONResponse(response)
 
-@app.get("/album_download/{task_id}/{filename}", summary="下載專輯視覺化任務結果")
+@app.get("/album_download/{task_id}/{filename}", summary="下載專輯視覺化任務結果", 
+    description="""
+參數說明：
+- task_id (str, 必填)：任務 ID
+- filename (str, 必填)：下載檔案名稱
+
+回傳：
+- 專輯視覺化影片檔案
+"""
+)
 async def album_download(task_id: str, filename: str):
     if task_id not in tasks or tasks[task_id]["status"] != TaskStatus.COMPLETED:
         raise HTTPException(status_code=404, detail="找不到可下載的檔案")
@@ -2588,6 +2360,225 @@ async def album_download(task_id: str, filename: str):
         filename=filename,
         background=BackgroundTask(lambda: None)
     )
+
+# ... existing code ...
+
+@app.post("/create_album_visualization_splitwave_async", summary="專輯風格音樂視覺化（左右分開雙波形，非同步）",
+    description="""
+參數說明：
+- audio (UploadFile, 必填)：音樂檔案
+- image (UploadFile, 必填)：主圖
+- subtitle (UploadFile, 必填)：字幕檔（SRT/ASS）
+- output_format (str, 預設mp4)：輸出影片格式
+- width (int, 預設1920)：影片寬度
+- height (int, 預設1080)：影片高度
+- blur (int, 預設40)：背景模糊強度
+- wave_width (int, 預設500)：每條波形寬度
+- wave_height (int, 預設150)：每條波形高度
+- wave_color (str, 預設white)：波形顏色
+- wave_y (int, 預設200)：波形在畫面Y軸的位置
+- wave_left_x (int, 預設100)：左波形X軸位置
+- wave_right_x (int, 預設1320)：右波形X軸位置
+- wave_opacity (float, 預設1.0)：波形透明度
+- wave_speed (int, 預設30)：波形幀率
+- font_name (str, 預設Arial)：字幕字型名稱
+- font_size (int, 預設36)：字幕字型大小
+- font_color (str, 預設white)：字幕字型顏色
+- border_style (int, 預設3)：字幕邊框樣式
+- border_size (int, 預設2)：字幕邊框大小
+- border_color (str, 預設black)：字幕邊框顏色
+- margin_vertical (int, 預設20)：字幕垂直邊距
+- alignment (int, 預設2)：字幕對齊方式
+
+回傳：
+- task_id (str)：任務 ID
+- status (str)：任務狀態
+- message (str)：提示訊息
+"""
+)
+async def create_album_visualization_splitwave_async(
+    background_tasks: BackgroundTasks,
+    audio: UploadFile = File(..., description="音樂檔案"),
+    image: UploadFile = File(..., description="主圖"),
+    subtitle: UploadFile = File(..., description="字幕檔（SRT/ASS）"),
+    output_format: str = "mp4",
+    width: int = 1920,
+    height: int = 1080,
+    blur: int = 40,
+    wave_width: int = 500,
+    wave_height: int = 150,
+    wave_color: str = "white",
+    wave_y: int = 200,
+    wave_left_x: int = 100,
+    wave_right_x: int = 1320,
+    wave_opacity: float = 1.0,
+    wave_speed: int = 30,
+    font_name: str = "Arial",
+    font_size: int = 36,
+    font_color: str = "white",
+    border_style: int = 3,
+    border_size: int = 2,
+    border_color: str = "black",
+    margin_vertical: int = 20,
+    alignment: int = 2
+):
+    import uuid, os
+    task_id = str(uuid.uuid4())
+    temp_dir = f"temp/{task_id}"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    audio_ext = os.path.splitext(audio.filename)[1]
+    image_ext = os.path.splitext(image.filename)[1]
+    subtitle_ext = os.path.splitext(subtitle.filename)[1].lower()
+
+    audio_path = os.path.join(temp_dir, f"audio{audio_ext}")
+    image_path = os.path.join(temp_dir, f"image{image_ext}")
+    subtitle_path = os.path.join(temp_dir, f"subtitle{subtitle_ext}")
+
+    with open(audio_path, "wb") as f:
+        f.write(await audio.read())
+    with open(image_path, "wb") as f:
+        f.write(await image.read())
+    with open(subtitle_path, "wb") as f:
+        f.write(await subtitle.read())
+
+    # 記錄任務
+    tasks[task_id] = {
+        "status": TaskStatus.PENDING,
+        "params": {
+            "audio_path": audio_path,
+            "image_path": image_path,
+            "subtitle_path": subtitle_path,
+            "output_format": output_format,
+            "width": width,
+            "height": height,
+            "blur": blur,
+            "wave_width": wave_width,
+            "wave_height": wave_height,
+            "wave_color": wave_color,
+            "wave_y": wave_y,
+            "wave_left_x": wave_left_x,
+            "wave_right_x": wave_right_x,
+            "wave_opacity": wave_opacity,
+            "wave_speed": wave_speed,
+            "font_name": font_name,
+            "font_size": font_size,
+            "font_color": font_color,
+            "border_style": border_style,
+            "border_size": border_size,
+            "border_color": border_color,
+            "margin_vertical": margin_vertical,
+            "alignment": alignment,
+            "temp_dir": temp_dir,
+            "subtitle_ext": subtitle_ext,
+        },
+        "output_path": None,
+        "error": None,
+        "progress": 0,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None
+    }
+
+    background_tasks.add_task(process_album_visualization_splitwave_task, task_id)
+    return JSONResponse({
+        "task_id": task_id,
+        "status": TaskStatus.PENDING,
+        "message": "任務已提交，請使用任務 ID 查詢進度"
+    })
+
+async def process_album_visualization_splitwave_task(task_id: str):
+    """處理專輯視覺化雙波形任務的背景工作函數"""
+    task = tasks[task_id]
+    params = task["params"]
+    try:
+        tasks[task_id]["status"] = TaskStatus.PROCESSING
+        tasks[task_id]["progress"] = 10
+
+        output_path = os.path.join(params["temp_dir"], f"output.{params['output_format']}")
+        subtitle_path = escape_ffmpeg_path(os.path.abspath(params["subtitle_path"]))
+        image_path = os.path.abspath(params["image_path"]).replace("\\", "/")
+        audio_path = os.path.abspath(params["audio_path"]).replace("\\", "/")
+
+        # filter_complex
+        filter_complex = (
+            f"[1:v]scale={params['width']}:{params['height']}:force_original_aspect_ratio=increase,"
+            f"crop={params['width']}:{params['height']},boxblur={params['blur']}:1[bg];"
+            f"[1:v]scale=720:720:force_original_aspect_ratio=decrease,"
+            f"pad=720:720:(ow-iw)/2:(oh-ih)/2:color=white[mainimg];"
+            f"[bg][mainimg]overlay=(W-w)/2:(H-h)/2:format=auto[base];"
+            f"[0:a]channelsplit=channel_layout=stereo[left][right];"
+            f"[left]showwaves=s={params['wave_width']}x{params['wave_height']}:mode=line:colors={params['wave_color']}:r={params['wave_speed']}[leftwave];"
+            f"[right]showwaves=s={params['wave_width']}x{params['wave_height']}:mode=line:colors={params['wave_color']}:r={params['wave_speed']}[rightwave];"
+            f"[base][leftwave]overlay={params['wave_left_x']}:{params['wave_y']}[tmp1];"
+            f"[tmp1][rightwave]overlay={params['wave_right_x']}:{params['wave_y']}[tmp2]"
+        )
+
+        # 字幕濾鏡處理
+        if params["subtitle_ext"] == ".srt":
+            filter_complex += f";[tmp2]subtitles='{subtitle_path}'[v]"
+        elif params["subtitle_ext"] == ".ass":
+            style_params = {
+                "font_name": params["font_name"],
+                "font_size": params["font_size"],
+                "font_color": params["font_color"],
+                "border_style": params["border_style"],
+                "border_size": params["border_size"],
+                "border_color": params["border_color"],
+                "margin_vertical": params["margin_vertical"],
+                "alignment": params["alignment"],
+                "shadow_size": 2,
+            }
+            style_str = build_force_style(style_params)
+            filter_complex += f";[tmp2]subtitles='{subtitle_path}':force_style='{style_str}'[v]"
+        else:
+            raise Exception("僅支援 .srt 或 .ass 字幕檔案格式。")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", audio_path,
+            "-i", image_path,
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "0:a",
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+            output_path
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            error_detail = stderr.decode(errors="ignore")
+            print(f"FFmpeg error: {error_detail}")
+            print(f"Filter complex: {filter_complex}")
+            print(f"Subtitle path: {subtitle_path}")
+            raise Exception(f"專輯視覺化雙波形影片生成失敗: {error_detail}")
+
+        tasks[task_id].update({
+            "status": TaskStatus.COMPLETED,
+            "output_path": output_path,
+            "progress": 100,
+            "completed_at": datetime.now().isoformat()
+        })
+    except Exception as e:
+        tasks[task_id].update({
+            "status": TaskStatus.FAILED,
+            "error": str(e),
+            "completed_at": datetime.now().isoformat()
+        })
+        try:
+            shutil.rmtree(params["temp_dir"])
+        except Exception:
+            pass
+
+# ... existing code ...
 
 if __name__ == "__main__":
     # 從環境變數獲取端口，如果沒有則使用預設值
