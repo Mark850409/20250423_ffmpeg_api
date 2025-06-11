@@ -2580,6 +2580,203 @@ async def process_album_visualization_splitwave_task(task_id: str):
 
 # ... existing code ...
 
+@app.post("/convert_wav_to_mp3_async",
+    summary="WAV 轉 MP3（非同步）",
+    description="""
+參數說明：
+- audio (UploadFile, 必填)：WAV 音訊檔案
+- bitrate (str, 預設192k)：MP3 位元率
+- sample_rate (int, 預設44100)：取樣率
+- channels (int, 預設2)：聲道數
+
+回傳：
+- task_id (str)：任務 ID
+- status (str)：任務狀態
+- message (str)：提示訊息
+"""
+)
+async def convert_wav_to_mp3_async(
+    background_tasks: BackgroundTasks,
+    audio: UploadFile = File(..., description="WAV 音訊檔案"),
+    bitrate: str = "192k",
+    sample_rate: int = 44100,
+    channels: int = 2
+):
+    # 產生任務 ID
+    task_id = str(uuid.uuid4())
+    # 將任務輸出目錄設定為 TASK_OUTPUT_DIR，與其他非同步任務一致
+    task_dir = os.path.join(TASK_OUTPUT_DIR, task_id) 
+    os.makedirs(task_dir, exist_ok=True)
+
+    # 儲存上傳的檔案
+    # 使用原始檔案的副檔名，確保正確儲存 WAV 檔案
+    input_filename_ext = os.path.splitext(audio.filename)[1]
+    input_path = os.path.join(task_dir, f"input{input_filename_ext}")
+    
+    # 根據原始檔名和時間戳生成一個友善的下載檔名
+    base_name = os.path.splitext(audio.filename)[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    download_filename = f"{base_name}_converted_{timestamp}.mp3"
+    # 輸出路徑使用生成的下載檔名
+    output_path = os.path.join(task_dir, download_filename)
+    
+    async with aiofiles.open(input_path, 'wb') as out_file:
+        content = await audio.read()
+        await out_file.write(content)
+
+    # 更新任務狀態，將所有參數儲存在 `params` 字典中
+    tasks[task_id] = {
+        "status": TaskStatus.PENDING,
+        "progress": 0,
+        "created_at": datetime.now().isoformat(),
+        "params": { 
+            "input_path": input_path,
+            "output_path": output_path,
+            "bitrate": bitrate,
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "task_dir": task_dir, # 儲存任務目錄以便清理
+            "download_filename": download_filename # 儲存預定的下載檔名
+        },
+        "output_path": output_path # 仍然保持直接的 output_path 引用，便於下載
+    }
+
+    # 加入背景任務
+    background_tasks.add_task(process_wav_to_mp3_task, task_id)
+    
+    return {
+        "task_id": task_id,
+        "status": TaskStatus.PENDING,
+        "message": "轉換任務已建立，請使用 /wav_to_mp3_task/{task_id} 查詢進度" # <--- 修改此行
+    }
+
+async def process_wav_to_mp3_task(task_id: str):
+    task = tasks[task_id]
+    params = task["params"]
+    
+    try:
+        task["status"] = TaskStatus.PROCESSING
+        task["progress"] = 10
+        
+        input_path = params["input_path"]
+        output_path = params["output_path"]
+        bitrate = params["bitrate"]
+        sample_rate = params["sample_rate"]
+        channels = params["channels"]
+        task_dir = params["task_dir"]
+
+        cmd = [
+            'ffmpeg',
+            '-i', input_path,
+            '-vn',
+            '-c:a', 'libmp3lame',
+            '-b:a', bitrate,
+            '-ar', str(sample_rate),
+            '-ac', str(channels),
+            '-y',
+            output_path
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            error_detail = stderr.decode(errors="ignore")
+            print(f"FFmpeg WAV to MP3 error: {error_detail}")
+            raise Exception(f"WAV 轉 MP3 失敗: {error_detail}")
+
+        if not os.path.exists(output_path):
+            raise Exception("輸出檔案未生成")
+
+        task["status"] = TaskStatus.COMPLETED
+        task["progress"] = 100
+        task["completed_at"] = datetime.now().isoformat()
+        
+    except Exception as e:
+        task["status"] = TaskStatus.FAILED
+        task["error"] = str(e)
+        task["completed_at"] = datetime.now().isoformat()
+        
+        if os.path.exists(task_dir):
+            shutil.rmtree(task_dir)
+            
+    finally:
+        # 清理輸入檔案，因為輸出檔案將由下載 API 的 BackgroundTask 或 cleanup_tasks 處理
+        if os.path.exists(input_path):
+            os.remove(input_path)
+
+
+# 新增 WAV 轉 MP3 的任務狀態查詢 API
+@app.get("/wav_to_mp3_task/{task_id}",
+    summary="查詢 WAV 轉 MP3 任務狀態",
+    description="使用任務 ID 查詢 WAV 轉 MP3 處理進度，當任務完成時會回傳下載連結"
+)
+async def get_wav_to_mp3_task_status(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="找不到指定的任務")
+    
+    task = tasks[task_id]
+    # 檢查任務類型是否為 WAV to MP3，以避免混淆
+    # 我們可以透過檢查 params 中是否有特定的 key 來判斷，例如 'bitrate'
+    if "bitrate" not in task["params"]:
+        raise HTTPException(status_code=400, detail="此任務ID不是WAV轉MP3任務")
+
+    response = {
+        "task_id": task_id,
+        "status": task["status"],
+        "progress": task["progress"],
+        "created_at": task["created_at"]
+    }
+    
+    if task["status"] == TaskStatus.COMPLETED:
+        download_filename = task["params"]["download_filename"]
+        
+        response["download_url"] = f"/wav_to_mp3_download/{task_id}/{download_filename}"
+        response["filename"] = download_filename
+        response["completed_at"] = task["completed_at"]
+    elif task["status"] == TaskStatus.FAILED:
+        response["error"] = task["error"]
+    
+    return JSONResponse(response)
+
+# 新增 WAV 轉 MP3 的下載 API
+@app.get("/wav_to_mp3_download/{task_id}/{filename}",
+    summary="下載已完成的 WAV 轉 MP3 任務結果",
+    description="下載已完成 WAV 轉 MP3 任務的音訊檔案"
+)
+async def wav_to_mp3_download(task_id: str, filename: str):
+    if task_id not in tasks or tasks[task_id]["status"] != TaskStatus.COMPLETED:
+        raise HTTPException(status_code=404, detail="找不到可下載的檔案或任務未完成")
+    
+    task = tasks[task_id]
+    # 再次檢查任務類型
+    if "bitrate" not in task["params"]:
+        raise HTTPException(status_code=400, detail="此任務ID不是WAV轉MP3任務")
+
+    output_path = task["output_path"]
+    download_filename = task["params"]["download_filename"]
+
+    # 確保請求的檔名與任務記錄的檔名一致，防止路徑遍歷攻擊
+    if filename != download_filename:
+        raise HTTPException(status_code=400, detail="無效的檔名")
+
+    if not output_path or not os.path.exists(output_path):
+        raise HTTPException(status_code=404, detail="檔案不存在")
+    
+    return FileResponse(
+        path=output_path,
+        media_type='audio/mpeg', # MP3 的 MIME type
+        filename=filename,
+        background=BackgroundTask(lambda: None) # 不刪除檔案，由清理任務處理
+    )
+
+# ... existing code ...
+
 if __name__ == "__main__":
     # 從環境變數獲取端口，如果沒有則使用預設值
     port = int(os.environ.get("PORT", 5000))
